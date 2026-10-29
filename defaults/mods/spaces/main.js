@@ -62,6 +62,7 @@ export default class Spaces extends View {
     this.pressed = null;
     this.over = null;
     this.machines = [];
+    this.backend = window()?.backend;
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
@@ -71,6 +72,14 @@ export default class Spaces extends View {
   }
 
   checkNew(cx) {
+    // Another backend runs the terminals now: its machines, not the old one's.
+    const backend = window()?.backend;
+    if (backend !== this.backend) {
+      this.backend = backend;
+      this.machines = [];
+      this.refreshMachines(cx);
+      cx.notify();
+    }
     const now = Date.now();
     const sp = spaces();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
