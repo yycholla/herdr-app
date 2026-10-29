@@ -38,6 +38,7 @@ pub fn connect_to(endpoint: Endpoint, saved: std::path::PathBuf) -> Result<Arc<C
     let control = Control::connect(&endpoint, "Herdr").with_context(|| format!("cannot reach the Rex server at {}", endpoint.origin))?;
     let version = control.call("server.version", json!({}), CALL).unwrap_or(Value::Null);
     let link = RexLink::start(control, endpoint, saved)?;
+    link.hosts.clone().watch(link.home.clone());
     // Herdr checks a core's generation, version and methods: Rex serves all of them.
     let hello = json!({
         "generation": hc::GENERATION,
@@ -85,6 +86,13 @@ struct Saved {
     extras: BTreeMap<String, SpaceExtra>,
 }
 
+/// One event stream for Herdr: every server's events, in one seq order.
+#[derive(Default)]
+struct Hub {
+    subscribers: Vec<async_channel::Sender<Stream>>,
+    seq: u64,
+}
+
 #[derive(Default)]
 struct State {
     /// Sessions in `session.list` order, and their latest views.
@@ -103,9 +111,11 @@ struct State {
     sessions: HashMap<String, String>,
     pending: BTreeMap<String, PendingRun>,
     placeholders: Vec<String>,
-    /// The event stream to Herdr: its subscribers and the last seq sent.
-    subscribers: Vec<async_channel::Sender<Stream>>,
-    seq: u64,
+    /// The event stream to Herdr, shared by every server.
+    hub: Arc<Mutex<Hub>>,
+    /// The machine name Herdr knows this server by (a Rex host's label);
+    /// empty for the home server. Addresses Herdr sees are `<prefix>/<address>`.
+    prefix: String,
     next_pending: u64,
     channels: HashMap<u32, Channel>,
 }
@@ -136,18 +146,62 @@ struct Inner {
     /// One document write at a time.
     writing: Mutex<()>,
     inputs: Mutex<mpsc::Sender<Input>>,
-    next_channel: AtomicU32,
 }
 
 pub struct RexLink {
-    inner: Arc<Inner>,
+    home: Arc<Inner>,
+    hosts: Arc<Hosts>,
+    hub: Arc<Mutex<Hub>>,
+    next_channel: AtomicU32,
+    /// The server behind each attached channel.
+    routes: Mutex<HashMap<u32, Arc<Inner>>>,
 }
 
 impl RexLink {
-    fn start(control: Arc<Control>, endpoint: Endpoint, saved_at: std::path::PathBuf) -> Result<RexLink> {
+    fn start(control: Arc<Control>, endpoint: Endpoint, saved: std::path::PathBuf) -> Result<RexLink> {
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        let home = Inner::open(control, endpoint, saved.clone(), hub.clone(), String::new())?;
+        let home_host = home.call("server.status", json!({})).ok().and_then(|s| s["host_id"].as_str().map(str::to_owned));
+        let dir = saved.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let hosts = Arc::new(Hosts { slots: Mutex::new(BTreeMap::new()), home_host, dir, hub: hub.clone(), stop: AtomicBool::new(false) });
+        Ok(RexLink { home, hosts, hub, next_channel: AtomicU32::new(1), routes: Mutex::new(HashMap::new()) })
+    }
+
+    /// The server a call's `on` names (a Rex host's label), else the home one.
+    fn on(&self, params: &Value) -> Result<Arc<Inner>> {
+        match params["on"].as_str().filter(|m| !m.is_empty()) {
+            Some(machine) => self.hosts.inner(machine),
+            None => Ok(self.home.clone()),
+        }
+    }
+
+    /// The server an address Herdr uses is on, and the address there.
+    fn route<'a>(&self, address: &'a str) -> Result<(Arc<Inner>, &'a str)> {
+        match address.split_once('/') {
+            Some((machine, local)) => Ok((self.hosts.inner(machine)?, local)),
+            None => Ok((self.home.clone(), address)),
+        }
+    }
+
+    /// Every connected server: home first.
+    fn servers(&self) -> Vec<Arc<Inner>> {
+        let mut all = vec![self.home.clone()];
+        all.extend(self.hosts.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().filter_map(|h| h.inner.clone()));
+        all
+    }
+
+    fn channel(&self, channel: u32) -> Option<Arc<Inner>> {
+        self.routes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&channel).cloned()
+    }
+}
+
+impl Inner {
+    /// Starts being a client of one server: attached to every session, its
+    /// views read, and its events, input and facts each on their own thread.
+    fn open(control: Arc<Control>, endpoint: Endpoint, saved_at: std::path::PathBuf, hub: Arc<Mutex<Hub>>, prefix: String) -> Result<Arc<Inner>> {
         let (inputs, queue) = mpsc::channel();
         let saved: Saved = std::fs::read(&saved_at).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let mut state = State { extras: saved.extras, ..State::default() };
+        let mut state = State { extras: saved.extras, hub, prefix, ..State::default() };
         for (herdr, rex) in &saved.aliases {
             state.aliases.bind(herdr, rex);
         }
@@ -159,7 +213,6 @@ impl RexLink {
             placed: Condvar::new(),
             writing: Mutex::new(()),
             inputs: Mutex::new(inputs),
-            next_channel: AtomicU32::new(1),
         });
         // Events from here on, every session attached, then the views.
         let boot = inner.control.call("session.bootstrap", json!({ "event_scope": "all", "attach_session_ids": [] }), CALL)?;
@@ -186,11 +239,20 @@ impl RexLink {
                 facts.learn(&session, &block);
             }
         })?;
-        Ok(RexLink { inner })
+        Ok(inner)
     }
-}
 
-impl Inner {
+    /// Leaves the server: the connection, input and streams end.
+    fn close(&self) {
+        self.control.close();
+        *self.inputs.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = mpsc::channel().0;
+        for c in self.lock().channels.values() {
+            c.stop.store(true, Ordering::Relaxed);
+            if let Some(stopper) = c.stopper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+                stopper.stop();
+            }
+        }
+    }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -276,20 +338,40 @@ impl Inner {
         }
         s.doc = doc;
         s.version += 1;
-        let seq = s.seq + 1;
-        Self::emit(s, &json!({ "method": "event", "params": { "seq": seq, "type": "doc" } }));
+        Self::emit(s, json!({ "method": "event", "params": { "type": "doc" } }));
     }
 
-    fn emit(s: &mut State, line: &Value) {
-        s.seq += 1;
+    fn emit(s: &State, mut line: Value) {
+        let mut hub = s.hub.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        hub.seq += 1;
+        line["params"]["seq"] = hub.seq.into();
         let mut bytes = line.to_string().into_bytes();
         bytes.push(b'\n');
-        s.subscribers.retain(|tx| tx.try_send(Stream::Data(bytes.clone())).is_ok());
+        hub.subscribers.retain(|tx| tx.try_send(Stream::Data(bytes.clone())).is_ok());
     }
 
-    fn emit_terminal(s: &mut State, kind: &str, address: &str, data: Value) {
-        let seq = s.seq + 1;
-        Self::emit(s, &json!({ "method": "event", "params": { "seq": seq, "type": kind, "terminal": address, "data": data } }));
+    fn emit_terminal(s: &mut State, kind: &str, address: &str, mut data: Value) {
+        if data.get("address").is_some() {
+            data = Self::shown(s, data);
+        }
+        if let Some(record) = data.get_mut("record") {
+            *record = Self::shown(s, record.take());
+        }
+        let address = Self::qualified(s, address);
+        Self::emit(s, json!({ "method": "event", "params": { "type": kind, "terminal": address, "data": data } }));
+    }
+
+    /// An address as Herdr sees it: `<host>/<address>` on a Rex host.
+    fn qualified(s: &State, address: &str) -> String {
+        if s.prefix.is_empty() { address.to_owned() } else { format!("{}/{address}", s.prefix) }
+    }
+
+    /// A terminal record as Herdr sees it.
+    fn shown(s: &State, mut record: Value) -> Value {
+        if let Some(address) = record["address"].as_str() {
+            record["address"] = Self::qualified(s, address).into();
+        }
+        record
     }
 
     fn address(s: &State, block: &str) -> String {
@@ -476,8 +558,12 @@ impl Inner {
         while let Ok(event) = events.recv_blocking() {
             self.handle(&event);
         }
-        // Lost the server: Herdr reconnects and reads everything again.
-        self.lock().subscribers.clear();
+        // Lost the home server: Herdr reconnects and reads everything again.
+        // A host's loss shows in the machine list; its terminals reattach later.
+        let s = self.lock();
+        if s.prefix.is_empty() {
+            s.hub.lock().unwrap_or_else(std::sync::PoisonError::into_inner).subscribers.clear();
+        }
     }
 
     fn handle(&self, event: &Event) {
@@ -683,9 +769,6 @@ impl Inner {
     }
 
     fn run(&self, p: &Value) -> Result<Value> {
-        if p["on"].as_str().is_some_and(|m| !m.is_empty()) {
-            return Err(rpc("failed", "Rex runs terminals on its own server: other machines aren't supported here yet"));
-        }
         let argv: Vec<String> = p["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_owned)).collect();
         let cwd = p["cwd"].as_str().unwrap_or_default();
         let mut options = json!({ "cwd": cwd });
@@ -702,13 +785,19 @@ impl Inner {
         s.terminals.insert(address.clone(), record.clone());
         s.pending.insert(address.clone(), PendingRun { spec: Pending { options, label }, labels });
         Self::emit_terminal(&mut s, "created", &address, record.clone());
-        Ok(record)
+        Ok(Self::shown(&s, record))
     }
 
     fn record(&self, address: &str) -> Result<Value> {
         let s = self.lock();
         let key = Self::block_of(&s, address).unwrap_or_else(|| address.to_owned());
-        s.terminals.get(&key).cloned().ok_or_else(|| rpc("not_found", format!("no terminal {address}")))
+        s.terminals.get(&key).cloned().map(|r| Self::shown(&s, r)).ok_or_else(|| rpc("not_found", format!("no terminal {address}")))
+    }
+
+    /// Every terminal record as Herdr sees it (`all`: finished ones too).
+    fn records(&self, all: bool) -> Vec<Value> {
+        let s = self.lock();
+        s.terminals.values().filter(|t| all || t["state"] == "live").map(|t| Self::shown(&s, t.clone())).collect()
     }
 
     fn kill(&self, address: &str) -> Result<Value> {
@@ -742,7 +831,7 @@ impl Inner {
         }
         let record = t.clone();
         Self::emit_terminal(&mut s, "labels", address, json!({ "labels": record["labels"], "record": record }));
-        Ok(record)
+        Ok(Self::shown(&s, record))
     }
 
     fn read(&self, p: &Value) -> Result<Value> {
@@ -897,18 +986,17 @@ impl Inner {
 
     // ---- data --------------------------------------------------------------
 
-    fn attach(self: &Arc<Self>, address: &str, cols: u16, rows: u16) -> Result<Attached> {
+    fn attach(self: &Arc<Self>, channel: u32, address: &str, cols: u16, rows: u16) -> Result<Attached> {
         let (session, block) = self.materialize(address)?;
         let _ = self.call("session.own_block", json!({ "session_id": session, "block_ids": [block], "mode": "request" }));
         let _ = self.terminal(&session, &block, "resize", json!({ "columns": cols.max(1), "rows": rows.max(1) }));
-        let channel = self.next_channel.fetch_add(1, Ordering::Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
         let stopper = Arc::new(Mutex::new(None));
         let (tx, rx) = async_channel::unbounded();
         let record = {
             let mut s = self.lock();
             s.channels.insert(channel, Channel { session: session.clone(), block: block.clone(), stop: stop.clone(), stopper: stopper.clone() });
-            s.terminals.get(&block).cloned().unwrap_or(Value::Null)
+            s.terminals.get(&block).cloned().map(|r| Self::shown(&s, r)).unwrap_or(Value::Null)
         };
         let worker = self.clone();
         std::thread::Builder::new().name(format!("rex-data-{channel}")).spawn(move || worker.stream(&session, &block, &tx, &stop, &stopper))?;
@@ -985,6 +1073,244 @@ impl Inner {
     }
 }
 
+/// How long the host manager waits between looks at the host list.
+const HOSTS_EVERY: Duration = Duration::from_secs(5);
+
+/// The other Rex servers the home server lists (`hosts.list`): Herdr's
+/// machines in Rex mode. Each connected one is a server of its own.
+struct Hosts {
+    slots: Mutex<BTreeMap<String, Host>>,
+    /// The home server's host_id: a host that is the home server isn't listed.
+    home_host: Option<String>,
+    /// Where each host's `Saved` file goes.
+    dir: std::path::PathBuf,
+    hub: Arc<Mutex<Hub>>,
+    stop: AtomicBool,
+}
+
+struct Host {
+    /// The host as Rex stores it (sent back unchanged on rename).
+    entry: Value,
+    state: &'static str,
+    why: Option<String>,
+    since_ms: Option<u64>,
+    inner: Option<Arc<Inner>>,
+}
+
+/// An endpoint from a host entry as the transport takes it: one with a
+/// scheme as it is, `host:port` a plain listener, a bare name a tailnet's HTTPS.
+fn endpoint_candidates(endpoint: &str) -> Vec<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.contains("://") {
+        vec![endpoint.to_owned()]
+    } else if endpoint.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>().is_ok()) {
+        vec![format!("ws://{endpoint}"), format!("wss://{endpoint}")]
+    } else {
+        vec![format!("wss://{endpoint}")]
+    }
+}
+
+/// What to call a server added by address: its host's first name, or its IP.
+fn label_for(target: &str) -> String {
+    let host = target.split("://").last().unwrap_or(target);
+    let host = host.split('/').next().unwrap_or(host);
+    let host = host.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(host, |(h, _)| h);
+    let host = host.trim_matches(['[', ']']);
+    if host.parse::<std::net::IpAddr>().is_ok() { host.to_owned() } else { host.split('.').next().unwrap_or(host).to_owned() }
+}
+
+impl Hosts {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Host>> {
+        self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The connected server Herdr calls `machine`.
+    fn inner(&self, machine: &str) -> Result<Arc<Inner>> {
+        match self.lock().get(machine) {
+            Some(Host { inner: Some(inner), .. }) => Ok(inner.clone()),
+            Some(h) => Err(rpc("unavailable", format!("{machine} is {}{}", h.state, h.why.as_ref().map(|w| format!(": {w}")).unwrap_or_default()))),
+            None => Err(rpc("not_found", format!("no machine {machine}"))),
+        }
+    }
+
+    /// Keeps the hosts connected, in the background, until the link closes.
+    fn watch(self: Arc<Self>, home: Arc<Inner>) {
+        let _ = std::thread::Builder::new().name("rex-hosts".into()).spawn(move || {
+            while !self.stop.load(Ordering::Relaxed) && !home.control.is_lost() {
+                self.tend(&home);
+                std::thread::sleep(HOSTS_EVERY);
+            }
+        });
+    }
+
+    /// Reads the host list, forgets removed hosts and connects the others.
+    fn tend(&self, home: &Arc<Inner>) {
+        let Ok(listed) = home.call("hosts.list", json!({})) else { return };
+        let hosts: Vec<Value> = listed["hosts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|h| self.home_host.is_none() || h["host_id"].as_str() != self.home_host.as_deref())
+            .cloned()
+            .collect();
+        let labels: Vec<String> = hosts.iter().filter_map(|h| h["label"].as_str().map(str::to_owned)).collect();
+        let gone: Vec<Host> = {
+            let mut slots = self.lock();
+            let gone = slots.keys().filter(|l| !labels.contains(l)).cloned().collect::<Vec<_>>();
+            for host in &hosts {
+                let Some(label) = host["label"].as_str() else { continue };
+                let slot = slots.entry(label.to_owned()).or_insert_with(|| Host { entry: Value::Null, state: "connecting", why: None, since_ms: Some(now_ms()), inner: None });
+                slot.entry = host.clone();
+            }
+            gone.iter().filter_map(|l| slots.remove(l)).collect()
+        };
+        for host in gone {
+            if let Some(inner) = host.inner {
+                inner.close();
+            }
+        }
+        for label in labels {
+            let (lost, entry) = {
+                let slots = self.lock();
+                let Some(h) = slots.get(&label) else { continue };
+                (h.inner.as_ref().is_none_or(|i| i.control.is_lost()), h.entry.clone())
+            };
+            if lost {
+                self.connect(&label, &entry);
+            }
+        }
+    }
+
+    /// Tries a host's endpoints in order; the first that answers is its server.
+    fn connect(&self, label: &str, entry: &Value) {
+        let mut why = String::from("it has no endpoints");
+        for endpoint in entry["endpoints"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            for origin in endpoint_candidates(endpoint) {
+                let opened = Endpoint::parse(&origin).and_then(|e| {
+                    let control = Control::connect(&e, "Herdr")?;
+                    let id = entry["id"].as_str().unwrap_or(label).replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+                    Inner::open(control, e, self.dir.join(format!("rex-{id}.json")), self.hub.clone(), label.to_owned())
+                });
+                match opened {
+                    Ok(inner) => {
+                        let mut slots = self.lock();
+                        if let Some(h) = slots.get_mut(label) {
+                            let was = h.inner.replace(inner);
+                            (h.state, h.why, h.since_ms) = ("connected", None, None);
+                            drop(slots);
+                            if let Some(old) = was {
+                                old.close();
+                            }
+                        } else {
+                            inner.close();
+                        }
+                        return;
+                    }
+                    Err(e) => why = format!("{endpoint}: {e:#}"),
+                }
+            }
+        }
+        if let Some(h) = self.lock().get_mut(label) {
+            if h.state != "unreachable" {
+                h.since_ms = Some(now_ms());
+            }
+            h.state = "unreachable";
+            h.why = Some(why);
+            if let Some(old) = h.inner.take() {
+                old.close();
+            }
+        }
+    }
+
+    /// The hosts as `hc machine ls` shows machines.
+    fn list(&self, home: &Arc<Inner>) -> Vec<Value> {
+        if self.lock().is_empty() {
+            self.tend(home);
+        }
+        self.lock()
+            .iter()
+            .map(|(label, h)| {
+                let endpoints: Vec<&str> = h.entry["endpoints"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                json!({
+                    "name": label,
+                    "target": endpoints.join(", "),
+                    "id": h.entry["id"],
+                    "host": label,
+                    "version": "",
+                    "state": h.state,
+                    "since_ms": h.since_ms,
+                    "why": h.why,
+                    "session": null,
+                    "temporary": false,
+                    "via": false,
+                })
+            })
+            .collect()
+    }
+
+    fn view(&self, home: &Arc<Inner>, label: &str) -> Result<Value> {
+        self.list(home).into_iter().find(|m| m["name"] == label).ok_or_else(|| rpc("not_found", format!("no machine {label}")))
+    }
+
+    /// Adds a Rex server by address, once it answers, to Rex's host list.
+    fn add(&self, home: &Arc<Inner>, target: &str, name: Option<&str>) -> Result<Value> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(rpc("bad_request", "Give the Rex server's address: a tailnet name, host:port, or a ws:// or wss:// origin"));
+        }
+        let label = name.map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| label_for(target), str::to_owned);
+        // It answers first, so the list only holds servers that work.
+        let mut reached = None;
+        let mut why = String::new();
+        for origin in endpoint_candidates(target) {
+            match Endpoint::parse(&origin).and_then(|e| Control::connect(&e, "Herdr")) {
+                Ok(control) => {
+                    reached = control.call("server.status", json!({}), CALL).ok();
+                    control.close();
+                    if reached.is_some() {
+                        break;
+                    }
+                }
+                Err(e) => why = format!("{e:#}"),
+            }
+        }
+        let Some(status) = reached else { return Err(rpc("unreachable", format!("Can't reach a Rex server at {target}: {why}"))) };
+        if self.home_host.is_some() && status["host_id"].as_str() == self.home_host.as_deref() {
+            return Err(rpc("bad_request", format!("{target} is this Rex server")));
+        }
+        let mut host = json!({ "label": label, "endpoints": [target], "added_from": "Herdr" });
+        if let Some(id) = status["host_id"].as_str() {
+            host["host_id"] = id.into();
+        }
+        home.call("hosts.put", json!({ "host": host })).map_err(|e| translate("hosts.put", &e))?;
+        self.tend(home);
+        self.view(home, &label)
+    }
+
+    fn remove(&self, home: &Arc<Inner>, machine: &str) -> Result<Value> {
+        let id = self.lock().get(machine).map(|h| h.entry["id"].clone()).ok_or_else(|| rpc("not_found", format!("no machine {machine}")))?;
+        home.call("hosts.remove", json!({ "id": id })).map_err(|e| translate("hosts.remove", &e))?;
+        self.tend(home);
+        Ok(json!({ "removed": true }))
+    }
+
+    fn rename(&self, home: &Arc<Inner>, machine: &str, new_name: &str) -> Result<Value> {
+        let mut entry = self.lock().get(machine).map(|h| h.entry.clone()).ok_or_else(|| rpc("not_found", format!("no machine {machine}")))?;
+        entry["label"] = new_name.trim().into();
+        if let Some(e) = entry.as_object_mut() {
+            e.remove("updated_at");
+            e.remove("source");
+        }
+        home.call("hosts.put", json!({ "host": entry })).map_err(|e| translate("hosts.put", &e))?;
+        // Its spaces and terminals are addressed by the old name: start it over.
+        if let Some(old) = self.lock().remove(machine).and_then(|h| h.inner) {
+            old.close();
+        }
+        self.tend(home);
+        self.view(home, new_name.trim())
+    }
+}
+
 /// Rex's foreground process as herdr-core reports one.
 fn foreground(f: &Value) -> Value {
     let name = f.get("script").or_else(|| f.get("name")).and_then(Value::as_str).unwrap_or_default();
@@ -994,31 +1320,45 @@ fn foreground(f: &Value) -> Value {
 
 impl Link for RexLink {
     fn call_timeout(&self, method: &str, params: Value, _timeout: Duration) -> Result<Value> {
-        let inner = &self.inner;
+        let address = params["terminal"].as_str().unwrap_or_default();
         match method {
-            "terminal.run" => inner.run(&params),
+            "terminal.run" => self.on(&params)?.run(&params),
             "terminal.list" => {
-                let s = inner.lock();
                 let all = params["all"].as_bool().unwrap_or(false);
-                let terminals: Vec<&Value> = s.terminals.values().filter(|t| all || t["state"] == "live").collect();
-                Ok(json!({ "terminals": terminals }))
+                Ok(json!({ "terminals": self.servers().iter().flat_map(|s| s.records(all)).collect::<Vec<_>>() }))
             }
             // Rex keeps every terminal until it's closed: keep changes nothing.
-            "terminal.get" | "terminal.keep" => inner.record(params["terminal"].as_str().unwrap_or_default()),
-            "terminal.kill" => inner.kill(params["terminal"].as_str().unwrap_or_default()),
-            "terminal.label" => inner.label(&params),
-            "terminal.read" => inner.read(&params),
-            "doc.get" => {
-                if params["on"].as_str().is_some_and(|m| !m.is_empty()) {
-                    return Err(rpc("not_found", "Rex has no other machines here"));
-                }
-                Ok(inner.doc_get())
+            "terminal.get" | "terminal.keep" => {
+                let (server, local) = self.route(address)?;
+                server.record(local)
             }
-            "doc.set" => inner.doc_set(&params),
-            "machine.list" => Ok(json!({ "machines": [] })),
+            "terminal.kill" => {
+                let (server, local) = self.route(address)?;
+                server.kill(local)
+            }
+            "terminal.label" => {
+                let (server, local) = self.route(address)?;
+                let mut params = params.clone();
+                params["terminal"] = local.into();
+                server.label(&params)
+            }
+            "terminal.read" => {
+                let (server, local) = self.route(address)?;
+                let mut params = params.clone();
+                params["terminal"] = local.into();
+                server.read(&params)
+            }
+            "doc.get" => Ok(self.on(&params)?.doc_get()),
+            "doc.set" => self.on(&params)?.doc_set(&params),
+            "machine.list" => Ok(json!({ "machines": self.hosts.list(&self.home) })),
+            "machine.add" => self.hosts.add(&self.home, params["target"].as_str().unwrap_or_default(), params["name"].as_str()),
+            "machine.rm" => self.hosts.remove(&self.home, params["machine"].as_str().unwrap_or_default()),
+            "machine.rename" => {
+                self.hosts.rename(&self.home, params["machine"].as_str().unwrap_or_default(), params["new_name"].as_str().unwrap_or_default())
+            }
             "server.status" => {
-                let version = inner.call("server.version", json!({})).ok().and_then(|v| v["rex_version"].as_str().map(|v| format!("rex {v}")));
-                Ok(json!({ "version": version, "installed_by": "rex", "backend": "rex", "endpoint": inner.endpoint.origin }))
+                let version = self.home.call("server.version", json!({})).ok().and_then(|v| v["rex_version"].as_str().map(|v| format!("rex {v}")));
+                Ok(json!({ "version": version, "installed_by": "rex", "backend": "rex", "endpoint": self.home.endpoint.origin }))
             }
             other => Err(rpc("unsupported", format!("{other} isn't available with a Rex server"))),
         }
@@ -1026,20 +1366,30 @@ impl Link for RexLink {
 
     fn subscribe(&self) -> Result<(u32, async_channel::Receiver<Stream>, Value)> {
         let (tx, rx) = async_channel::unbounded();
-        let mut s = self.inner.lock();
-        s.subscribers.push(tx);
-        let terminals: Vec<Value> = s.terminals.values().cloned().collect();
-        let channel = self.inner.next_channel.fetch_add(1, Ordering::Relaxed);
-        Ok((channel, rx, json!({ "channel": channel, "seq": s.seq, "terminals": terminals })))
+        // Subscribed first: whatever changes while the snapshot is read comes after its seq.
+        let seq = {
+            let mut hub = self.hub.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            hub.subscribers.push(tx);
+            hub.seq
+        };
+        let terminals: Vec<Value> = self.servers().iter().flat_map(|s| s.records(true)).collect();
+        let channel = self.next_channel.fetch_add(1, Ordering::Relaxed);
+        Ok((channel, rx, json!({ "channel": channel, "seq": seq, "terminals": terminals })))
     }
 
     fn attach(&self, terminal: &str, cols: u16, rows: u16, _display: Value) -> Result<Attached> {
-        self.inner.attach(terminal, cols, rows)
+        let (server, local) = self.route(terminal)?;
+        let channel = self.next_channel.fetch_add(1, Ordering::Relaxed);
+        let attached = server.attach(channel, local, cols, rows)?;
+        self.routes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(channel, server);
+        Ok(attached)
     }
 
     fn input(&self, channel: u32, bytes: &[u8]) {
-        if let Some((session, block)) = self.inner.channel(channel) {
-            self.inner.send(Input::Write { session, block, data: String::from_utf8_lossy(bytes).into_owned() });
+        if let Some(server) = self.channel(channel)
+            && let Some((session, block)) = server.channel(channel)
+        {
+            server.send(Input::Write { session, block, data: String::from_utf8_lossy(bytes).into_owned() });
         }
     }
 
@@ -1049,19 +1399,25 @@ impl Link for RexLink {
     fn credit(&self, _channel: u32, _n: usize) {}
 
     fn resize(&self, channel: u32, cols: u16, rows: u16) {
-        if let Some((session, block)) = self.inner.channel(channel) {
-            self.inner.send(Input::Resize { session, block, cols, rows });
+        if let Some(server) = self.channel(channel)
+            && let Some((session, block)) = server.channel(channel)
+        {
+            server.send(Input::Resize { session, block, cols, rows });
         }
     }
 
     fn focus(&self, channel: u32, focused: bool) {
-        if focused && let Some((session, block)) = self.inner.channel(channel) {
-            self.inner.send(Input::Focus { session, block });
+        if focused
+            && let Some(server) = self.channel(channel)
+            && let Some((session, block)) = server.channel(channel)
+        {
+            server.send(Input::Focus { session, block });
         }
     }
 
     fn detach(&self, channel: u32) {
-        if let Some(c) = self.inner.lock().channels.remove(&channel) {
+        let Some(server) = self.routes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&channel) else { return };
+        if let Some(c) = server.lock().channels.remove(&channel) {
             c.stop.store(true, Ordering::Relaxed);
             if let Some(stopper) = c.stopper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
                 stopper.stop();
@@ -1070,7 +1426,14 @@ impl Link for RexLink {
     }
 
     fn lost(&self) -> async_channel::Receiver<()> {
-        self.inner.control.lost()
+        self.home.control.lost()
+    }
+
+    fn close(&self) {
+        self.hosts.stop.store(true, Ordering::Relaxed);
+        for server in self.servers() {
+            server.close();
+        }
     }
 }
 
@@ -1089,20 +1452,32 @@ mod tests {
         child: Child,
         dir: PathBuf,
         endpoint: Endpoint,
+        /// `127.0.0.1:<port>`, when it also listens on TCP.
+        address: Option<String>,
     }
 
     impl Server {
         fn start() -> Server {
+            Server::start_with(false)
+        }
+
+        /// One that other servers' clients reach over TCP, as a Rex host.
+        fn start_with(tcp: bool) -> Server {
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             let dir = std::env::temp_dir().join(format!("herdr-rex-{}-{nanos}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("init.lua"), "").unwrap();
             let origin = format!("unix://{}", dir.join("rex.sock").display());
-            let child = Command::new("rex")
-                .args(["server", "run", "--restore=false", "--listen", &origin, "--state-dir"])
-                .arg(dir.join("state"))
-                .arg("--config")
-                .arg(dir.join("init.lua"))
+            let address = tcp.then(|| {
+                let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                reserved.local_addr().unwrap().to_string()
+            });
+            let mut command = Command::new("rex");
+            command.args(["server", "run", "--restore=false", "--listen", &origin, "--state-dir"]).arg(dir.join("state")).arg("--config").arg(dir.join("init.lua"));
+            if let Some(address) = &address {
+                command.args(["--extra-listen", &format!("http://{address}"), "--allow-anonymous"]);
+            }
+            let child = command
                 .env("SHELL", "/bin/sh")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -1110,7 +1485,7 @@ mod tests {
                 .spawn()
                 .expect("rex on PATH");
             let endpoint = Endpoint::parse(&origin).unwrap();
-            let server = Server { child, dir, endpoint };
+            let server = Server { child, dir, endpoint, address };
             let deadline = Instant::now() + Duration::from_secs(10);
             while Control::connect(&server.endpoint, "herdr-test").is_err() {
                 assert!(Instant::now() < deadline, "the isolated Rex server didn't start");
@@ -1246,5 +1621,80 @@ mod tests {
         write(&core, &model);
         until("the session to go", || sessions().is_empty());
         core.detach(attached.channel);
+    }
+
+    #[test]
+    fn host_endpoints_and_names_follow_the_rex_cli() {
+        assert_eq!(endpoint_candidates("studio.tail1234.ts.net"), ["wss://studio.tail1234.ts.net"]);
+        assert_eq!(endpoint_candidates("192.168.1.20:7297"), ["ws://192.168.1.20:7297", "wss://192.168.1.20:7297"]);
+        assert_eq!(endpoint_candidates("wss://rex.example"), ["wss://rex.example"]);
+        assert_eq!(label_for("studio.tail1234.ts.net"), "studio");
+        assert_eq!(label_for("192.168.1.20:7297"), "192.168.1.20");
+        assert_eq!(label_for("wss://attic.example:443"), "attic");
+        assert_eq!(label_for("[::1]:7297"), "::1");
+    }
+
+    fn cli(core: &Core, args: &[&str]) -> (i32, Value) {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        let (code, out, _) = crate::hc::machine_cli(core, &args);
+        (code, serde_json::from_str(&out).unwrap())
+    }
+
+    #[test]
+    #[ignore = "starts two isolated Rex servers: needs `rex` on PATH"]
+    fn rex_hosts_are_herdrs_machines_with_their_own_spaces() {
+        let home = Server::start();
+        let studio = Server::start_with(true);
+        let core = connect_to(home.endpoint.clone(), home.dir.join("rex.json")).unwrap();
+        assert_eq!(cli(&core, &["machine", "ls", "--json"]), (0, json!({ "machines": [] })));
+
+        // Added by address: Rex's own host list holds it, and Herdr connects.
+        let address = studio.address.clone().unwrap();
+        let (code, added) = cli(&core, &["machine", "add", &address, "--name", "studio", "--json"]);
+        assert_eq!(code, 0, "{added}");
+        assert_eq!(added["state"], "connected", "{added}");
+        let rex = Control::connect(&home.endpoint, "herdr-test-observer").unwrap();
+        let hosts = rex.call("hosts.list", json!({}), CALL).unwrap();
+        assert_eq!(hosts["hosts"][0]["label"], "studio");
+        assert_eq!(hosts["hosts"][0]["endpoints"], json!([address]));
+        let (code, error) = cli(&core, &["machine", "add", "127.0.0.1:1", "--json"]);
+        assert_eq!(code, 1);
+        assert!(error["error"]["message"].as_str().unwrap().contains("Can't reach"), "{error}");
+
+        // A space there is a session on that server; its terminals are studio/….
+        let t = core.run(vec![], Some("/tmp".into()), json!({ "herdr.space": "p1", "herdr.tab": "c1" }), Some("studio")).unwrap();
+        assert!(t.starts_with("studio/"), "{t}");
+        let mut model = Model::default();
+        model.add_space("p1", "remote", "/tmp", Tab::new("c1", "", "x1", t.strip_prefix("studio/").unwrap()));
+        let doc = |on: &str| core.call("doc.get", json!({ "name": "herdr-app", "on": on })).unwrap();
+        let value = serde_json::to_value(Document::capture(&model, None)).unwrap();
+        core.call("doc.set", json!({ "name": "herdr-app", "on": "studio", "version": doc("studio")["version"], "value": value })).unwrap();
+        let there = Control::connect(&studio.endpoint, "herdr-test-observer").unwrap();
+        let sessions = there.call("session.list", json!({}), CALL).unwrap();
+        assert_eq!(sessions["sessions"][0]["label"], "remote");
+        assert_eq!(rex.call("session.list", json!({}), CALL).unwrap()["sessions"], json!([]), "nothing on the home server");
+        assert_eq!(doc("studio")["value"]["spaces"][0]["id"], "p1");
+        let listed = core.call("terminal.list", json!({})).unwrap();
+        assert!(listed["terminals"].as_array().unwrap().iter().any(|r| r["address"] == t), "{listed}");
+        let attached = core.attach(&t, 80, 24, json!({})).unwrap();
+        until("the remote snapshot", || matches!(attached.stream.try_recv(), Ok(Stream::Snapshot(_))));
+
+        // Renamed and removed through the same `hc machine` calls the mods make.
+        assert_eq!(cli(&core, &["machine", "rename", "studio", "attic"]).1["name"], "attic");
+        assert_eq!(rex.call("hosts.list", json!({}), CALL).unwrap()["hosts"][0]["label"], "attic");
+        assert_eq!(cli(&core, &["machine", "rm", "attic"]).0, 0);
+        assert_eq!(rex.call("hosts.list", json!({}), CALL).unwrap()["hosts"], json!([]));
+        assert_eq!(there.call("session.list", json!({}), CALL).unwrap()["sessions"].as_array().map(Vec::len), Some(1), "its sessions keep running");
+
+        // Closing (switching backends) ends the connection at once.
+        let lost = core.closed();
+        core.close();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut lost = Box::pin(lost);
+        let waker = std::task::Waker::noop();
+        while std::future::Future::poll(lost.as_mut(), &mut std::task::Context::from_waker(waker)).is_pending() {
+            assert!(Instant::now() < deadline, "the link didn't close");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

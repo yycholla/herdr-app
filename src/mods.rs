@@ -808,6 +808,23 @@ fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
     Ok(Some(String::from_utf8_lossy(&out).into_owned()))
 }
 
+/// `hc` for mods. With Rex running the terminals, `hc machine ...` is about
+/// Rex's servers, so it goes to the backend instead of herdr-core.
+fn hc_future(args: Vec<String>) -> impl std::future::Future<Output = Result<HostValue, HostError>> + Send {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let r = match crate::hc::current().filter(|c| c.kind == crate::hc::Kind::Rex) {
+            Some(core) if args.first().map(String::as_str) == Some("machine") => Ok(crate::hc::machine_cli(&core, &args)),
+            _ => run_blocking("hc", &args, None),
+        };
+        let _ = tx.send_blocking(r);
+    });
+    async move {
+        let (code, stdout, stderr) = rx.recv().await.map_err(|_| HostError::new("the command was lost"))?.map_err(HostError::new)?;
+        Ok(HostObject::new().field("code", code as f64).field("stdout", stdout).field("stderr", stderr).into())
+    }
+}
+
 fn exec_future(command: String, args: Vec<String>, cwd: Option<String>, on: Option<String>) -> impl std::future::Future<Output = Result<HostValue, HostError>> + Send {
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
@@ -848,7 +865,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             let expected = a.get(2).and_then(|v| match v { HostValue::Str(s) => Some(s.clone()), _ => None });
             Ok(crate::mod_files::write_text(a.string(0)?.to_owned(), a.string(1)?.to_owned(), expected))
         })
-        .async_function("hc", |a| Ok(exec_future("hc".into(), strings(a.get(0)), None, None)))
+        .async_function("hc", |a| Ok(hc_future(strings(a.get(0)))))
         .function("home", |_| Ok(home().to_string_lossy().into_owned().into()))
         .function("appHome", |_| Ok(app_dir().to_string_lossy().into_owned().into()))
         .function("fonts", |_| Ok(to_host(&json!(*FONTS.lock().unwrap()))))

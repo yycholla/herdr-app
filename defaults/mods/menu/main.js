@@ -61,7 +61,7 @@ function items(p, git) {
         ["Close", "space.close", { id: tg.id }],
       ];
     case "backend": {
-      // What runs the terminals; the shown one is checked. Switching restarts Herdr.
+      // What runs the terminals; the shown one is checked.
       const now = window()?.backend ?? "herdr-core";
       return [
         ["herdr-core", "app.backend", { backend: "herdr-core" }, now === "herdr-core"],

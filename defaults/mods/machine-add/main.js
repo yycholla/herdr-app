@@ -4,11 +4,12 @@
 // key), the same command opens in a small terminal window where you answer
 // it; the list sees the machine once it's added. Opened as a dialog
 // (`mod.open machine-add`); the sidebars' Add machine and the welcome
-// open it.
+// open it. With Rex running the terminals, a machine is another Rex server,
+// added by its address to Rex's own host list (shared with Rex.app).
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { hc, exec, home, readTextFile, theme, props, closeOverlay, openOverlay } from "herdr";
+import { hc, exec, home, readTextFile, theme, props, closeOverlay, openOverlay, window } from "herdr";
 
 const I = (name) => `mods/workspace-chrome/${name}.svg`;
 
@@ -36,7 +37,8 @@ export default class MachineAdd extends View {
     this.added = [];
     this.state = {}; // target -> "adding" | "terminal" | error text
     this.typed = "";
-    this.input = InputState.new({ placeholder: "user@host" });
+    this.rex = window()?.backend === "rex";
+    this.input = InputState.new({ placeholder: this.rex ? "studio.tail1234.ts.net or host:7297" : "user@host" });
     this.input.on("change", (_e, cx) => { this.typed = this.input.value(); cx.notify(); });
     this.input.on("submit", (_e, cx) => this.add(this.typed, cx));
     this.inputFocused = true;
@@ -50,7 +52,7 @@ export default class MachineAdd extends View {
     this.opened = {};
     this.handle = cx.focus_handle();
     cx.spawn(async (cx) => {
-      this.hosts = parseConfig(await readTextFile(`${home()}/.ssh/config`).catch(() => null));
+      this.hosts = this.rex ? [] : parseConfig(await readTextFile(`${home()}/.ssh/config`).catch(() => null));
       await this.refresh();
       cx.notify();
     });
@@ -100,8 +102,9 @@ export default class MachineAdd extends View {
         this.input.set_value("");
         this.typed = "";
         await this.refresh();
-        await this.checkMac(target);
-      } else if (["hc_missing", "incompatible", "login_needed", "auth_failed", "host_key"].includes(why.kind) || /password|passphrase|host key|permission denied|login/i.test(why.message ?? "")) {
+        if (!this.rex) await this.checkMac(target);
+      } else if (this.rex) this.state[target] = why.message || "it didn't answer";
+      else if (["hc_missing", "incompatible", "login_needed", "auth_failed", "host_key"].includes(why.kind) || /password|passphrase|host key|permission denied|login/i.test(why.message ?? "")) {
         this.state[target] = "terminal";
         await this.inTerminal(target);
       } else this.state[target] = why.message || "it didn't work";
@@ -293,16 +296,18 @@ export default class MachineAdd extends View {
       .p(18)
       .bg(t.popover)
       .text_color(t.foreground)
-      .child(h_flex().items_center().child(div().flex_1().text_size(15).font_semibold().child("Add a machine")).child(div().text_size(11).text_color(t.dim).child("Esc")))
+      .child(h_flex().items_center().child(div().flex_1().text_size(15).font_semibold().child(this.rex ? "Add a Rex server" : "Add a machine")).child(div().text_size(11).text_color(t.dim).child("Esc")))
       .child(
         div()
           .pt(6)
           .text_size(12.8)
           .line_height("19px")
           .text_color(t.muted)
-          .child("A VPS, a Mac mini, a box at home: Herdr reaches it over ssh, and agents there keep running while your laptop sleeps."),
+          .child(this.rex
+            ? "Another machine's Rex server: its tailnet name, host:port, or a ws:// or wss:// address. It joins Rex's host list, so Rex.app sees it too."
+            : "A VPS, a Mac mini, a box at home: Herdr reaches it over ssh, and agents there keep running while your laptop sleeps."),
       )
-      .child(div().pt(16).pb(6).text_size(11.5).font_medium().text_color(t.dim).child(hosts.length ? "From your ssh config" : "Your ssh config lists no hosts"))
+      .when(!this.rex, (el) => el.child(div().pt(16).pb(6).text_size(11.5).font_medium().text_color(t.dim).child(hosts.length ? "From your ssh config" : "Your ssh config lists no hosts"))
       .child(
         v_flex()
           .id("ma-hosts")
@@ -313,8 +318,8 @@ export default class MachineAdd extends View {
               ? [div().px(10).py(8).text_size(12.5).text_color(t.dim).child("Reading ~/.ssh/config…")]
               : hosts.map((h) => this.row(t, h.alias, h.alias, [h.user, h.hostname].filter(Boolean).join("@") || (h.aliases.length ? `also ${h.aliases.join(", ")}` : ""))),
           ),
-      )
-      .child(div().pt(14).pb(6).text_size(11.5).font_medium().text_color(t.dim).child("Or type how ssh reaches it"))
+      ))
+      .child(div().pt(14).pb(6).text_size(11.5).font_medium().text_color(t.dim).child(this.rex ? "Its address" : "Or type how ssh reaches it"))
       .child(
         h_flex()
           .gap(8)

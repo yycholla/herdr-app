@@ -87,7 +87,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("app.palette", &[], "Open the command palette: every command by name, with its key."),
     cmd("app.settings", &[opt("section")], "Open the settings (section: look, alerts, updates)."),
     cmd("app.check_updates", &[], "Look for a newer Herdr and herdr-core now."),
-    cmd("app.backend", &[req("backend")], "Run terminals on \"herdr-core\" or a \"rex\" server (settings.json `rex_server`, else the local one). Herdr restarts on the new backend; terminals keep running on the old one."),
+    cmd("app.backend", &[req("backend")], "Run terminals on \"herdr-core\" or a \"rex\" server (settings.json `rex_server`, else the local one). The window switches to its spaces and terminals; the old backend's keep running there."),
     cmd("app.update_core", &[], "Update herdr-core to its latest release of this generation; terminals keep running."),
     cmd("app.reset", &[], "The escape hatch: set the shown layout and keys aside, back to the default screen."),
     cmd("app.theme", &[req("name")], "Use a theme (a preset or themes/<name>.json)."),

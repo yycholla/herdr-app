@@ -233,6 +233,40 @@ pub trait Link: Send + Sync {
     fn detach(&self, channel: u32);
     /// Closes when the connection drops.
     fn lost(&self) -> async_channel::Receiver<()>;
+    /// Ends the connection now (switching backends); `lost` closes.
+    fn close(&self);
+}
+
+static CURRENT: Mutex<Option<std::sync::Weak<Core>>> = Mutex::new(None);
+
+/// The window's core now: mods' `hc machine` calls go to its backend.
+pub fn set_current(core: &Arc<Core>) {
+    *CURRENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(core));
+}
+
+pub fn current() -> Option<Arc<Core>> {
+    CURRENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade)
+}
+
+/// `hc machine ...` answered by a core's own machine methods, printed as the
+/// CLI prints them (JSON; an error as `{"error": {...}}`, exit code 1).
+pub fn machine_cli(core: &Core, args: &[String]) -> (i32, String, String) {
+    let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| !a.starts_with("--")).collect();
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str);
+    let call = match words.get(1..).unwrap_or_default() {
+        ["ls" | "list", ..] => core.call("machine.list", json!({})),
+        ["add", target, ..] => core.call_timeout("machine.add", json!({ "target": target, "name": flag("--name") }), Duration::from_secs(30)),
+        ["rm" | "remove", machine, ..] => core.call("machine.rm", json!({ "machine": machine })),
+        ["rename", machine, new_name, ..] => core.call("machine.rename", json!({ "machine": machine, "new_name": new_name })),
+        _ => Err(anyhow::Error::new(RpcError(json!({ "message": format!("hc {} isn't available with a Rex server", args.join(" ")), "data": { "kind": "unsupported" } })))),
+    };
+    match call {
+        Ok(v) => (0, v.to_string(), String::new()),
+        Err(e) => {
+            let message = e.downcast_ref::<RpcError>().and_then(|r| r.0["message"].as_str().map(str::to_owned)).unwrap_or_else(|| format!("{e:#}"));
+            (1, json!({ "error": { "message": message, "kind": error_kind(&e) } }).to_string(), String::new())
+        }
+    }
 }
 
 /// Which backend a Core talks to.
@@ -412,6 +446,7 @@ impl Core {
     pub fn resize(&self, channel: u32, cols: u16, rows: u16) { self.link.resize(channel, cols, rows) }
     pub fn focus(&self, channel: u32, focused: bool) { self.link.focus(channel, focused) }
     pub fn detach(&self, channel: u32) { self.link.detach(channel) }
+    pub fn close(&self) { self.link.close() }
 }
 
 impl HcLink {
@@ -434,6 +469,12 @@ impl HcLink {
 impl Link for HcLink {
     fn lost(&self) -> async_channel::Receiver<()> {
         self.lost.clone()
+    }
+
+    fn close(&self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
     }
 
     fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {

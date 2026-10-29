@@ -3,8 +3,8 @@
 Herdr can run its terminals on a Rex server
 instead of herdr-core. Pick it from the menu under the Herdr logo (top left),
 with `app.backend {"backend": "rex"}`, or with `"backend": "rex"` in
-settings.json. Switching restarts the app; terminals keep running on the
-backend left behind.
+settings.json. The window switches in place to that backend's spaces;
+terminals keep running on the backend left behind.
 
 ## Who owns what
 
@@ -51,11 +51,21 @@ the app uses, so the window, model and mods are unchanged.
   time. Rex events become herdr-core event lines (`created`, `title`,
   `status`, `foreground`, `finished`, `removed`, `doc`).
 
+## Machines
+
+Each backend has its own machines. With Rex they are the home server's host
+list (`hosts.list`), shared with Rex.app and the `rex` CLI: Add machine
+takes a Rex server's address (a tailnet name, `host:port`, or a `ws://` or
+`wss://` origin), checks that it answers, and saves it with `hosts.put`.
+Herdr connects to each host as one more Rex client; its spaces are that
+server's sessions, and its terminals are `<label>/<block id>`. A bare name
+is tried as `wss://`, a `host:port` as `ws://` then `wss://`. The host's
+server must already let this machine in (Tailscale, or its own listener
+rules). Mods' `hc machine ls/add/rm/rename` go to the backend.
+
 ## Not yet
 
-- Other machines: Rex hosts aren't offered as Herdr machines yet;
-  `terminal.run` with `on` fails.
-- Mods that shell out to `hc` still talk to herdr-core.
+- Mods' other `hc` calls (and `exec` with `on`) still talk to herdr-core.
 - Floating layers and non-terminal blocks are kept as Rex has them but not
   shown (see `project.rs`).
 - Rex's Lua key bindings (`client.key`) and client actions aren't wired:

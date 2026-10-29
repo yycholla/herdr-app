@@ -672,9 +672,13 @@ impl AppWindow {
             loop {
                 let Ok(core) = this.update(cx, |this, _| this.core.clone()) else { break };
                 core.closed().await;
+                // Switched backends: the old one closed on purpose.
+                if this.update(cx, |this, _| !Arc::ptr_eq(&this.core, &core)).unwrap_or(true) {
+                    continue;
+                }
                 tracing::warn!("lost the core; reconnecting");
                 crate::telemetry::count("core_lost");
-                // The same backend again: switching is app.backend's (a restart).
+                // The same backend again: switching is app.backend's.
                 let kind = core.kind;
                 drop(core);
                 let fresh = loop {
@@ -688,6 +692,7 @@ impl AppWindow {
                 }
             }
         }));
+        crate::hc::set_current(&w.core);
         Self::note_core(&w.core);
         w.sync(window, cx);
         // The first time the app opens: the frame's welcome (it sets
@@ -777,11 +782,39 @@ impl AppWindow {
             slot.blocked = false;
         }
         Self::note_core(&core);
+        crate::hc::set_current(&core);
         self.core = core.clone();
         self.publish(cx);
         for t in self.terms.values() {
             t.view.update(cx, |v, cx| v.reattach(core.clone(), cx));
         }
+        cx.notify();
+    }
+
+    /// Now on another backend: its spaces and terminals replace the old
+    /// one's, which keep running there. Nothing is written to the new backend
+    /// before its layout has been read.
+    fn switched(&mut self, core: Arc<Core>, backend: settings::Backend, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!("switched to {:?}", core.kind);
+        self.write_person(|p| p.backend = backend, window, cx);
+        let old = std::mem::replace(&mut self.core, core.clone());
+        self.core_generation += 1;
+        crate::hc::set_current(&core);
+        self.documents_watching = false;
+        self.documents = {
+            let mut local = crate::mirror_sync::Slot::default();
+            local.connection(true, None, None);
+            [(String::new(), local)].into()
+        };
+        self.pending_terminals.clear();
+        self.model.spaces.clear();
+        self.model.active = None;
+        self.terms.clear();
+        self.live.clear();
+        Self::note_core(&core);
+        old.close();
+        self.publish(cx);
+        self.sync(window, cx);
         cx.notify();
     }
 
@@ -3089,21 +3122,27 @@ impl AppWindow {
                     Some("herdr-core" | "herdr" | "hc") => settings::Backend::Herdr,
                     other => return self.fail(format!("no backend {other:?}: \"herdr-core\" or \"rex\"")),
                 };
-                let now = match self.core.kind {
-                    crate::hc::Kind::Herdr => settings::Backend::Herdr,
-                    crate::hc::Kind::Rex => settings::Backend::Rex,
+                let kind = match backend {
+                    settings::Backend::Herdr => crate::hc::Kind::Herdr,
+                    settings::Backend::Rex => crate::hc::Kind::Rex,
                 };
-                if backend == now {
+                if kind == self.core.kind {
                     return;
                 }
                 if settings::load_person().is_err() {
                     return self.fail("settings.json can't be read: fix it before switching backends");
                 }
-                self.write_person(|p| p.backend = backend, window, cx);
-                // A window holds one backend's spaces and panes: start over on the other.
-                self.drain_documents(window, cx);
-                crate::update::restart();
-                cx.quit();
+                cx.spawn_in(window, async move |this, cx| {
+                    let core = cx.background_executor().spawn(async move { Core::connect_kind(kind) }).await;
+                    let _ = this.update_in(cx, |this, window, cx| match core {
+                        Ok(core) => this.switched(core, backend, window, cx),
+                        Err(e) => {
+                            let name = if kind == crate::hc::Kind::Rex { "the Rex server" } else { "herdr-core" };
+                            this.layout_notice(&format!("Can't reach {name}"), &format!("{e:#}"), window, cx);
+                        }
+                    });
+                })
+                .detach();
             }
             "app.update_core" => {
                 if crate::update::core().ready.is_none() && crate::update::core().error.is_none() {

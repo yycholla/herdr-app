@@ -533,7 +533,7 @@ The main ones:
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
 - App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}`, `overlay.close {id?}`, `app.help`, `app.palette`, `app.settings {section?}`
   (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do),
-  `app.check_updates`, `app.backend {backend}` (`"herdr-core"` or `"rex"`; restarts Herdr), `app.update_core` (a newer herdr-core of this generation, terminals kept;
+  `app.check_updates`, `app.backend {backend}` (`"herdr-core"` or `"rex"`), `app.update_core` (a newer herdr-core of this generation, terminals kept;
   never one a package manager owns), `app.welcome`, `app.whats_new`, `app.feedback {message?, from?}` (from `"person"` or `"agent"`; opens a review window, where the person can paste up to 3 screenshots; never sends until the person clicks Send), `app.reset`,
   `app.theme {name}`, `app.zoom_in`, `app.zoom_out`, `app.zoom_reset`,
   `app.update` (restart into a downloaded update).
@@ -579,9 +579,12 @@ What's about the user, never a look:
   or `"rex"`, a Rex server. With Rex, Rex's sessions are the spaces, its
   windows the tabs and its splits the panes, shared live with every other
   Rex client; Herdr's changes become Rex calls. Clicking the Herdr logo, or
-  `app.backend {backend}`, switches and restarts the app; terminals keep
-  running on the backend left behind. Read at start; if the Rex server can't
-  be reached, Herdr starts on herdr-core.
+  `app.backend {backend}`, switches the window to that backend's spaces;
+  terminals keep running on the backend left behind. Each backend has its
+  own machines: herdr-core's (`hc machine`) or Rex's host list (other Rex
+  servers by address, shared with Rex.app and the `rex` CLI); mods' `hc
+  machine ls/add/rm/rename` follow the backend. If the Rex server can't be
+  reached at start, Herdr starts on herdr-core.
 - `rex_server`: the Rex server to use: a socket path, or a `unix://`,
   `ws://` or `wss://` origin. Absent: `REX_SERVER`, then the local server's
   socket (`$XDG_RUNTIME_DIR/rex/server.sock`).

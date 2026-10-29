@@ -593,3 +593,16 @@ fn the_logo_picks_the_backend(cx: &mut TestAppContext) {
         assert_eq!(checked, 1, "exactly the running backend is checked: {menu}");
     }
 }
+
+#[gpui::test]
+fn adding_a_machine_on_rex_takes_a_rex_servers_address(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for backend in ["herdr-core", "rex"] {
+        let mut values = fixture(true, json!({}), updates("current", "current"));
+        values.insert("window".into(), json!({"platform":"linux","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true,"backend":backend}));
+        let dialog = describe_with_values(cx, &staged, "mods/machine-add", values, None).unwrap();
+        assert_eq!(dialog.contains("Add a Rex server"), backend == "rex", "{backend}: {dialog}");
+        assert_eq!(dialog.contains("ssh"), backend != "rex", "Rex servers aren't reached over ssh: {dialog}");
+    }
+}

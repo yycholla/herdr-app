@@ -447,8 +447,9 @@ pub struct Control {
     welcome: Value,
     routes: Arc<Mutex<Routes>>,
     next_id: AtomicU64,
-    /// Requests for the IO thread. Dropping it (with `Control`) closes the socket.
-    outgoing: mpsc::Sender<String>,
+    /// Requests for the IO thread. Dropping it (`close`, or with `Control`)
+    /// closes the socket.
+    outgoing: Mutex<Option<mpsc::Sender<String>>>,
     message_limit: usize,
     events: async_channel::Receiver<Event>,
     lost: async_channel::Receiver<()>,
@@ -498,7 +499,7 @@ impl Control {
                 let _ = reply.send(Err(Failure::Lost));
             }
         })?;
-        Ok(Arc::new(Control { welcome, routes, next_id: AtomicU64::new(1), outgoing, message_limit: limit, events, lost }))
+        Ok(Arc::new(Control { welcome, routes, next_id: AtomicU64::new(1), outgoing: Mutex::new(Some(outgoing)), message_limit: limit, events, lost }))
     }
 
     /// The server's welcome message.
@@ -553,7 +554,8 @@ impl Control {
                 bail!("{method}: lost the Rex server");
             }
             routes.replies.insert(id, tx);
-            if self.outgoing.send(text).is_err() {
+            let sent = self.outgoing.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|o| o.send(text).is_ok());
+            if !sent {
                 routes.replies.remove(&id);
                 bail!("{method}: lost the Rex server");
             }
@@ -567,6 +569,12 @@ impl Control {
                 bail!("{method}: no reply from the Rex server within {timeout:?}")
             }
         }
+    }
+
+    /// Leaves the server now (a close frame; sessions stay), though other
+    /// holders of this `Control` remain: calls fail, `events` and `lost` close.
+    pub fn close(&self) {
+        self.outgoing.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     /// Every event, in order. Meant for one reader. Closes with the connection.
