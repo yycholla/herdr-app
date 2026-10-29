@@ -1679,7 +1679,7 @@ mod tests {
         vt.write(b"\x1b[0m\r\nZ");
         let f = vt.frame();
         assert_eq!(f.rows[3][0].text, "Z");
-        assert_eq!(f.rows[3][0].fg, readable(Rgb(1, 2, 3), theme().bg));
+        assert_eq!(f.rows[3][0].fg, Rgb(1, 2, 3));
     }
 
     #[test]
