@@ -398,14 +398,12 @@ pub struct Event {
     /// the event it wraps (see `session_id`); every other event by its own
     /// type (`session_created`, `client_perform_requested`, …).
     pub kind: String,
-    pub seq: u64,
     /// The whole event message.
     pub message: Value,
 }
 
 impl Event {
     pub(crate) fn from_message(message: Value) -> Event {
-        let seq = message["seq"].as_u64().unwrap_or(0);
         let outer = &message["payload"];
         let kind = match outer["type"].as_str() {
             Some("session_event") => outer["payload"]["event"]["type"].as_str(),
@@ -413,7 +411,7 @@ impl Event {
         }
         .unwrap_or_default()
         .to_owned();
-        Event { kind, seq, message }
+        Event { kind, message }
     }
 
     /// The session a `session_event` came from.
@@ -444,7 +442,6 @@ struct Routes {
 }
 
 pub struct Control {
-    welcome: Value,
     routes: Arc<Mutex<Routes>>,
     next_id: AtomicU64,
     /// Requests for the IO thread. Dropping it (`close`, or with `Control`)
@@ -462,7 +459,7 @@ impl Control {
     }
 
     /// Like `connect`, continuing the client of an earlier connection when
-    /// `reconnect_token` (from its welcome) is still good: see `resumed()`.
+    /// `reconnect_token` (from its welcome) is still good (the welcome says whether it was).
     pub fn connect_resuming(endpoint: &Endpoint, client_label: &str, reconnect_token: Option<&str>) -> Result<Arc<Control>> {
         let mut socket = open_websocket(endpoint, "/api/control", "rex.control.v1", MAX_MESSAGE_BYTES)?;
         socket.send(Message::text(hello(client_label, reconnect_token))).context("cannot send the Rex hello")?;
@@ -499,32 +496,7 @@ impl Control {
                 let _ = reply.send(Err(Failure::Lost));
             }
         })?;
-        Ok(Arc::new(Control { welcome, routes, next_id: AtomicU64::new(1), outgoing: Mutex::new(Some(outgoing)), message_limit: limit, events, lost }))
-    }
-
-    /// The server's welcome message.
-    pub fn welcome(&self) -> &Value {
-        &self.welcome
-    }
-
-    /// This client's ID, which stays the same across a resumed connection.
-    pub fn client_id(&self) -> Option<&str> {
-        self.welcome["client"]["id"].as_str()
-    }
-
-    /// The token to continue this client on a new connection. Never log it.
-    pub fn reconnect_token(&self) -> Option<&str> {
-        self.welcome["client"]["reconnect_token"].as_str()
-    }
-
-    /// Whether this connection continued an earlier client.
-    pub fn resumed(&self) -> bool {
-        self.welcome["client"]["resumed"].as_bool().unwrap_or(false)
-    }
-
-    /// The negotiated message limit, in bytes.
-    pub fn message_limit(&self) -> usize {
-        self.message_limit
+        Ok(Arc::new(Control { routes, next_id: AtomicU64::new(1), outgoing: Mutex::new(Some(outgoing)), message_limit: limit, events, lost }))
     }
 
     /// Calls a method and waits for its result. Safe from any thread; calls
@@ -897,7 +869,7 @@ pub(crate) mod tests {
     fn events_are_named_by_what_they_wrap() {
         let event = Event::from_message(json!({"type": "event", "seq": 4, "payload": {"type": "session_event", "payload": {
             "session_id": "session:1", "event": {"type": "session_view_changed", "payload": {"revision": 3}}}}}));
-        assert_eq!((event.kind.as_str(), event.seq), ("session_view_changed", 4));
+        assert_eq!(event.kind, "session_view_changed");
         assert_eq!(event.session_id(), Some("session:1"));
         assert_eq!(event.body()["revision"], 3);
         let event = Event::from_message(json!({"type": "event", "seq": 1, "payload": {"type": "session_created", "payload": {"session": {}}}}));
@@ -987,15 +959,11 @@ pub(crate) mod tests {
     const T: Duration = Duration::from_secs(5);
 
     #[test]
-    fn welcome_is_kept_and_limits_negotiated() {
+    fn the_message_limit_is_negotiated() {
         let (control, server) = mock(|peer| {
             let r = request(peer);
             respond(peer, &r, 0, json!({}));
         });
-        assert_eq!(control.client_id(), Some("client:1"));
-        assert_eq!(control.reconnect_token(), Some("secret"));
-        assert!(!control.resumed());
-        assert_eq!(control.message_limit(), 65536);
         let error = control.call("x", json!({"text": "x".repeat(70_000)}), T).unwrap_err();
         assert!(error.to_string().contains("message limit"), "{error}");
         assert_eq!(control.call("ok", Value::Null, T).unwrap(), json!({}));
@@ -1091,7 +1059,7 @@ pub(crate) mod tests {
         let mut got = Vec::new();
         // The events channel closes with the connection.
         while let Ok(event) = events.recv_blocking() {
-            got.push((event.seq, event.kind));
+            got.push((event.message["seq"].as_u64().unwrap(), event.kind));
         }
         let kinds = ["session_view_changed", "session_view_changed", "session_view_changed", "session_created"];
         assert_eq!(got, (1..=4).zip(kinds.map(String::from)).collect::<Vec<_>>());
@@ -1196,7 +1164,6 @@ pub(crate) mod tests {
     fn live_read_only_calls() {
         let endpoint = Endpoint::discover(None).unwrap();
         let control = Control::connect(&endpoint, "herdr-rex-test").unwrap();
-        assert!(control.client_id().is_some());
         let version = control.call("server.version", Value::Null, T).unwrap();
         assert!(version["rex_version"].is_string(), "{version}");
         let sessions = control.call("session.list", Value::Null, T).unwrap();

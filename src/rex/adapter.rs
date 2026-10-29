@@ -567,10 +567,13 @@ impl Inner {
     }
 
     fn handle(&self, event: &Event) {
-        let outer = &event.message["payload"];
-        match outer["type"].as_str().unwrap_or(event.kind.as_str()) {
+        let body = event.body();
+        if let Some(session) = event.session_id() {
+            return self.session_event(session, &event.kind, body);
+        }
+        match event.kind.as_str() {
             "session_created" => {
-                if let Some(session) = outer.pointer("/payload/session/session_id").and_then(Value::as_str) {
+                if let Some(session) = body.pointer("/session/session_id").and_then(Value::as_str) {
                     self.attach_session(session);
                     self.refresh_all();
                 }
@@ -579,15 +582,10 @@ impl Inner {
             // Another client's action for this one, or a call to make for it:
             // Herdr offers none, so say so at once rather than keep it waiting.
             "client_call_requested" | "client_perform_requested" => {
-                if let Some(call) = outer.pointer("/payload/call_id").and_then(Value::as_str) {
+                if let Some(call) = body["call_id"].as_str() {
                     let error = json!({ "code": "not_supported", "message": "Herdr doesn't perform Rex client actions" });
                     let _ = self.call("client.reply", json!({ "call_id": call, "error": error }));
                 }
-            }
-            "session_event" => {
-                let session = outer.pointer("/payload/session_id").and_then(Value::as_str).unwrap_or_default();
-                let inner = &outer["payload"]["event"];
-                self.session_event(session, inner["type"].as_str().unwrap_or_default(), &inner["payload"]);
             }
             _ => {}
         }

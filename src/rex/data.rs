@@ -167,16 +167,6 @@ impl DataConn {
         self.nonce
     }
 
-    /// How long the server holds the stream for a `resume` after a drop.
-    pub fn grace(&self) -> Duration {
-        Duration::from_millis(u64::from(self.grace_ms))
-    }
-
-    /// Stream bytes returned by `read` so far (what `resume` reports).
-    pub fn received(&self) -> u64 {
-        self.received
-    }
-
     /// A handle that stops this connection from another thread.
     pub fn stopper(&self) -> DataStop {
         DataStop(self.stop.clone())
@@ -378,7 +368,7 @@ mod tests {
         });
         let mut data = DataConn::open(&control, &endpoint, "session:1", "block:1").unwrap();
         assert_eq!(data.nonce(), 42);
-        assert_eq!(data.grace(), Duration::from_secs(60));
+        assert_eq!(data.grace_ms, 60_000);
         let mut got = Vec::new();
         loop {
             match data.read() {
@@ -388,7 +378,7 @@ mod tests {
             }
         }
         assert_eq!(got, b"GHOSTSNPabcdef!");
-        assert_eq!(data.received(), 15);
+        assert_eq!(data.received, 15);
         server.join().unwrap();
     }
 
@@ -489,7 +479,7 @@ mod tests {
             got.extend(data.read().unwrap().expect("the stream ended early"));
         }
         assert_eq!(&got[..8], b"GHOSTSNP");
-        assert_eq!(data.received(), got.len() as u64);
+        assert_eq!(data.received, got.len() as u64);
         data.close();
         assert_eq!(data.read().unwrap(), None);
     }
