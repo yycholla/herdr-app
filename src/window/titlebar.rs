@@ -84,6 +84,10 @@ impl AppWindow {
             "maximized": window.is_maximized(),
             "fullscreen": window.is_fullscreen(),
             "active": self.window_active,
+            "backend": match self.core.kind {
+                crate::hc::Kind::Herdr => "herdr-core",
+                crate::hc::Kind::Rex => "rex",
+            },
         })
     }
 

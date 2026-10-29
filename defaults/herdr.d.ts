@@ -244,6 +244,8 @@ export function window(): {
   maximized: boolean;
   fullscreen: boolean;
   active: boolean;
+  /** What runs the terminals (settings.json `backend`; `app.backend` switches). */
+  backend: "herdr-core" | "rex";
 };
 
 /** For a floating mod: where it sits now. `vertical` on the left/right edges, horizontal on

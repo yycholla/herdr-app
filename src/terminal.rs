@@ -185,6 +185,9 @@ impl TerminalView {
             // The core repaints the whole screen (and history) on attach.
             let (cw, ch) = (f32::from(g.cell.width) as u32, f32::from(g.cell.height) as u32);
             g.vt = Vt::new(cols, rows);
+            if core.kind == crate::hc::Kind::Rex {
+                g.vt.deny_local_media();
+            }
             g.vt.resize(cols, rows, cw, ch);
             g.core = core.clone();
             g.channel = None;
@@ -300,7 +303,13 @@ impl TerminalView {
                             g.core.credit(ch, bytes.len());
                             // What the core leaves to viewers (e.g. kitty graphics replies).
                             let replies = g.vt.take_replies();
-                            g.core.input(ch, &replies);
+                            g.core.reply(ch, &replies);
+                        }
+                    }
+                    Stream::Snapshot(bytes) => {
+                        // Rex: the terminal as it is now, before its live output.
+                        if let Err(e) = g.vt.import_snapshot(&bytes) {
+                            tracing::warn!("cannot load the terminal's snapshot: {e:#}");
                         }
                     }
                     Stream::Closed(why) => {
@@ -1286,7 +1295,7 @@ impl Render for TerminalView {
                                 g.core.resize(chan, cols, rows);
                                 // Mode 2048 programs wait for this report, not SIGWINCH.
                                 let replies = g.vt.take_replies();
-                                g.core.input(chan, &replies);
+                                g.core.reply(chan, &replies);
                             }
                         }
                     },

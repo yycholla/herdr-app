@@ -302,6 +302,13 @@ pub struct Person {
     /// The herdr-core to use, when it isn't where Herdr looks (core_bin.rs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core: Option<String>,
+    /// What runs the terminals: herdr-core (the default) or a Rex server.
+    #[serde(skip_serializing_if = "Backend::is_herdr")]
+    pub backend: Backend,
+    /// The Rex server to use: a socket path, `unix://`, `ws://` or `wss://`
+    /// origin. Unset: `REX_SERVER`, then the local server's socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rex_server: Option<String>,
     /// Fonts for layouts that don't set their own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
@@ -323,6 +330,34 @@ pub struct Person {
     pub theme: Option<crate::layout::ThemeChoice>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    #[serde(rename = "herdr-core")]
+    Herdr,
+    Rex,
+}
+
+impl Backend {
+    fn is_herdr(&self) -> bool {
+        *self == Backend::Herdr
+    }
+}
+
+/// The backend settings.json chooses (herdr-core when unset or unreadable).
+pub fn backend() -> crate::hc::Kind {
+    match load_person().map(|p| p.backend).unwrap_or_default() {
+        Backend::Herdr => crate::hc::Kind::Herdr,
+        Backend::Rex => crate::hc::Kind::Rex,
+    }
+}
+
+/// The configured Rex server, if settings.json names one.
+pub fn rex_server() -> Option<String> {
+    load_person().ok().and_then(|p| p.rex_server).filter(|s| !s.trim().is_empty())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -350,6 +385,8 @@ impl Default for Person {
             zoom: 1.0,
             sounds: Sounds::default(),
             core: None,
+            backend: Backend::Herdr,
+            rex_server: None,
             font: None,
             font_size: None,
             ui_font: None,

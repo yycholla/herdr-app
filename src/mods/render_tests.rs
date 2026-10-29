@@ -575,3 +575,21 @@ fn shipped_layouts_and_keys() {
         }
     }
 }
+
+#[gpui::test]
+fn the_logo_picks_the_backend(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for backend in ["herdr-core", "rex"] {
+        let mut values = fixture(true, json!({}), updates("current", "current"));
+        values.insert("window".into(), json!({"platform":"linux","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true,"backend":backend}));
+        let header = describe_with_values(cx, &staged, "mods/workspace-chrome", values.clone(), None).unwrap();
+        assert!(header.contains("backend") && header.contains("Herdr"), "{backend}: {header}");
+        assert_eq!(header.contains("\"Rex\""), backend == "rex", "the Rex tag shows only on Rex: {header}");
+        values.insert("props".into(), json!({"overlay":"o1","tab":"backend"}));
+        let menu = describe_with_values(cx, &staged, "mods/menu", values, None).unwrap();
+        assert!(menu.contains("herdr-core") && menu.contains("Rex"), "{menu}");
+        let checked = menu.lines().filter(|l| l.contains("check.svg")).count();
+        assert_eq!(checked, 1, "exactly the running backend is checked: {menu}");
+    }
+}

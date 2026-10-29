@@ -431,6 +431,40 @@ pub fn relaunch() {
     }
 }
 
+/// Starts this same build again, with the same arguments, once this process
+/// has exited (switching backends).
+pub fn restart() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(unix)]
+    let spawned = {
+        use std::os::unix::process::CommandExt;
+        Command::new("sh")
+            .arg("-c")
+            .arg("pid=$1; shift; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.1; done; exec \"$@\"")
+            .arg("herdr-restart")
+            .arg(std::process::id().to_string())
+            .arg(&exe)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+    };
+    #[cfg(windows)]
+    let spawned = {
+        let quoted: Vec<String> = args.iter().map(|a| format!("'{}'", a.to_string_lossy().replace('\'', "''"))).collect();
+        let list = if quoted.is_empty() { String::new() } else { format!(" -ArgumentList {}", quoted.join(",")) };
+        let exe = exe.to_string_lossy().replace('\'', "''");
+        let script = format!("Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process '{exe}'{list}", std::process::id());
+        crate::spawn::command("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    };
+    if let Err(e) = spawned {
+        tracing::warn!("cannot restart the app: {e}");
+    }
+}
+
 /// Opens the app again once this process has exited (after `apply`).
 #[cfg(unix)]
 pub fn relaunch() {

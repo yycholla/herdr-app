@@ -1,6 +1,6 @@
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { theme, run, props, window, shared, setShared, updates, layout } from "herdr";
+import { theme, run, props, window, shared, setShared, updates, layout, openOverlay } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -44,7 +44,15 @@ export default class WorkspaceChrome extends View {
     }
     return h_flex().size_full().bg(t.chrome).pl(collapsed ? 6 : 14).pr(10).gap(4).items_center().text_size(13.5)
       .when(window()?.platform === "macos" && !collapsed, el => el.pl(76))
-      .when(!collapsed, el => el.child(h_flex().flex_1().gap(8).items_center().child(image("frame/welcome/herdr.png").size(20).rounded(5)).child(div().font_semibold().text_color(t.foreground).child("Herdr"))))
+      // The logo picks what runs the terminals: herdr-core or a Rex server.
+      .when(!collapsed, el => el.child(h_flex().flex_1().min_w(0).child(h_flex().id("backend").gap(8).px(4).py(3).rounded(6).items_center().cursor_pointer()
+        .hover(s => s.bg(t.hover))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click(() => openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "backend" } }))
+        .child(image("frame/welcome/herdr.png").size(20).rounded(5))
+        .child(div().font_semibold().text_color(t.foreground).child("Herdr"))
+        .when(window()?.backend === "rex", el => el.child(div().px(5).rounded(4).bg(t.hover).text_size(11).text_color(t.muted).child("Rex")))
+        .child(svg("mods/workspace-chrome/chevron-down.svg").size(12).text_color(t.dim)))))
       .when(!collapsed, el => el.child(this.button("search", svg("mods/workspace-chrome/search.svg").size(15), () => run("mod.open", { name: "picker" }))))
       // On the macOS rail the traffic lights fill the row; the agents list's » unfolds it.
       .when(!(collapsed && window()?.platform === "macos"), el => el.child(this.button("sidebar-toggle", svg("mods/workspace-chrome/sidebar.svg").size(15), toggleSidebar)));

@@ -20,6 +20,9 @@ pub const FOCUS: u8 = 4;
 
 pub enum Stream {
     Data(Vec<u8>),
+    /// A whole-terminal snapshot (Ghostty `GHOSTSNP`) to load before any later
+    /// Data. Only Rex sends one; herdr-core replays history as Data.
+    Snapshot(Vec<u8>),
     /// The core ended the stream; the payload says why (e.g. the program exited).
     Closed(Value),
     /// The connection to the core dropped. The program is most likely still
@@ -211,9 +214,43 @@ pub fn check(hello: &Value) -> Result<(), Mismatch> {
     if missing.is_empty() { Ok(()) } else { Err(Mismatch::Missing(missing)) }
 }
 
+/// What the app needs from a backend: herdr-core's framed pipe or a Rex server.
+/// Calls block the caller and so never run on the UI thread.
+pub trait Link: Send + Sync {
+    fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value>;
+    /// The event stream (hc event lines) and its snapshot (`seq`, `terminals`).
+    fn subscribe(&self) -> Result<(u32, async_channel::Receiver<Stream>, Value)>;
+    fn attach(&self, terminal: &str, cols: u16, rows: u16, display: Value) -> Result<Attached>;
+    /// Bytes the person typed, pasted or sent with the mouse.
+    fn input(&self, channel: u32, bytes: &[u8]);
+    /// The display's own answers to device queries. herdr-core's terminals
+    /// have no other emulator, so they go to the program; Rex's terminal
+    /// answers for itself and drops these.
+    fn reply(&self, channel: u32, bytes: &[u8]);
+    fn credit(&self, channel: u32, n: usize);
+    fn resize(&self, channel: u32, cols: u16, rows: u16);
+    fn focus(&self, channel: u32, focused: bool);
+    fn detach(&self, channel: u32);
+    /// Closes when the connection drops.
+    fn lost(&self) -> async_channel::Receiver<()>;
+}
+
+/// Which backend a Core talks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Herdr,
+    Rex,
+}
+
 pub struct Core {
-    /// What the core said when we connected (generation, version, methods).
+    /// What the backend said when we connected (generation, version, methods).
     pub hello: Value,
+    pub kind: Kind,
+    link: Box<dyn Link>,
+}
+
+/// herdr-core through `hc connect`.
+struct HcLink {
     /// Frames for the writer thread: a core that stops reading never blocks the caller (the UI).
     writer: mpsc::Sender<Vec<u8>>,
     routes: Arc<Mutex<Routes>>,
@@ -279,14 +316,8 @@ impl Core {
 
         let routes = Arc::new(Mutex::new(Routes::default()));
         let (lost_tx, lost) = async_channel::bounded::<()>(1);
-        let core = Arc::new(Core {
-            hello: hello.get("result").cloned().unwrap_or(Value::Null),
-            writer,
-            routes: routes.clone(),
-            next_id: AtomicU64::new(1),
-            child: Mutex::new(child),
-            lost,
-        });
+        let link = HcLink { writer, routes: routes.clone(), next_id: AtomicU64::new(1), child: Mutex::new(child), lost };
+        let core = Arc::new(Core::new(hello.get("result").cloned().unwrap_or(Value::Null), Kind::Herdr, Box::new(link)));
         std::thread::Builder::new().name("hc-reader".into()).spawn(move || {
             let _lost_tx = lost_tx;
             while let Some((channel, kind, payload)) = read_frame(&mut reader) {
@@ -331,13 +362,25 @@ impl Core {
         Ok(core)
     }
 
-    /// Resolves once the connection to the core is gone.
-    pub async fn closed(&self) {
-        let _ = self.lost.recv().await;
+    pub fn new(hello: Value, kind: Kind, link: Box<dyn Link>) -> Core {
+        Core { hello, kind, link }
     }
 
-    pub fn send(&self, channel: u32, kind: u8, payload: &[u8]) {
-        let _ = self.writer.send(encode(channel, kind, payload));
+    /// Connects to the backend people chose in settings.
+    pub fn connect_chosen() -> Result<Arc<Core>> {
+        Core::connect_kind(crate::settings::backend())
+    }
+
+    pub fn connect_kind(kind: Kind) -> Result<Arc<Core>> {
+        match kind {
+            Kind::Herdr => Core::connect(),
+            Kind::Rex => crate::rex::connect(),
+        }
+    }
+
+    /// Resolves once the connection to the core is gone.
+    pub async fn closed(&self) {
+        let _ = self.link.lost().recv().await;
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -345,6 +388,55 @@ impl Core {
     }
 
     pub fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.link.call_timeout(method, params, timeout)
+    }
+
+    /// Starts a program in a new core terminal and returns its address (`tN`).
+    /// Starts a terminal, here or on another machine (`on`: its name in `hc machine ls`).
+    pub fn run(&self, argv: Vec<String>, cwd: Option<String>, labels: Value, on: Option<&str>) -> Result<String> {
+        let env = json!({"TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "herdr"});
+        let r = self.call("terminal.run", json!({"argv": argv, "cwd": cwd, "env": env, "labels": labels, "on": on, "keep": true}))?;
+        r.get("address")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("terminal.run returned no address: {r}"))
+    }
+
+    /// One subscription includes local and forwarded remote events.
+    /// The event stream, and its snapshot (`seq`, `terminals`) to apply it to.
+    pub fn subscribe(&self) -> Result<(u32, async_channel::Receiver<Stream>, Value)> { self.link.subscribe() }
+    pub fn attach(&self, terminal: &str, cols: u16, rows: u16, display: Value) -> Result<Attached> { self.link.attach(terminal, cols, rows, display) }
+    pub fn input(&self, channel: u32, bytes: &[u8]) { if !bytes.is_empty() { self.link.input(channel, bytes) } }
+    pub fn reply(&self, channel: u32, bytes: &[u8]) { if !bytes.is_empty() { self.link.reply(channel, bytes) } }
+    pub fn credit(&self, channel: u32, n: usize) { self.link.credit(channel, n) }
+    pub fn resize(&self, channel: u32, cols: u16, rows: u16) { self.link.resize(channel, cols, rows) }
+    pub fn focus(&self, channel: u32, focused: bool) { self.link.focus(channel, focused) }
+    pub fn detach(&self, channel: u32) { self.link.detach(channel) }
+}
+
+impl HcLink {
+    fn send(&self, channel: u32, kind: u8, payload: &[u8]) {
+        let _ = self.writer.send(encode(channel, kind, payload));
+    }
+
+    /// Routes a channel the core just opened to a fresh receiver.
+    fn route(&self, channel: u32) -> async_channel::Receiver<Stream> {
+        let (tx, rx) = async_channel::unbounded();
+        let mut r = self.routes.lock().unwrap();
+        for item in r.early.remove(&channel).unwrap_or_default() {
+            let _ = tx.try_send(item);
+        }
+        r.streams.insert(channel, tx);
+        rx
+    }
+}
+
+impl Link for HcLink {
+    fn lost(&self) -> async_channel::Receiver<()> {
+        self.lost.clone()
+    }
+
+    fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         {
@@ -364,73 +456,53 @@ impl Core {
         }
     }
 
-    /// Starts a program in a new core terminal and returns its address (`tN`).
-    /// Starts a terminal, here or on another machine (`on`: its name in `hc machine ls`).
-    pub fn run(&self, argv: Vec<String>, cwd: Option<String>, labels: Value, on: Option<&str>) -> Result<String> {
-        let env = json!({"TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "herdr"});
-        let r = self.call("terminal.run", json!({"argv": argv, "cwd": cwd, "env": env, "labels": labels, "on": on, "keep": true}))?;
-        r.get("address")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("terminal.run returned no address: {r}"))
-    }
-
-    /// One subscription includes local and forwarded remote events.
-    /// The event stream, and its snapshot (`seq`, `terminals`) to apply it to.
-    pub fn subscribe(&self) -> Result<(u32, async_channel::Receiver<Stream>, Value)> {
-        let result = self.call("events.subscribe", json!({}))?;
+    fn subscribe(&self) -> Result<(u32, async_channel::Receiver<Stream>, Value)> {
+        let result = self.call_timeout("events.subscribe", json!({}), Duration::from_secs(10))?;
         let channel = result["channel"].as_u64().ok_or_else(|| anyhow!("subscription returned no channel"))? as u32;
-        let (tx, rx) = async_channel::unbounded();
-        let mut r = self.routes.lock().unwrap();
-        for item in r.early.remove(&channel).unwrap_or_default() { let _ = tx.try_send(item); }
-        r.streams.insert(channel, tx);
-        drop(r);
+        let rx = self.route(channel);
         self.credit(channel, 1024 * 1024);
         Ok((channel, rx, result))
     }
 
-    pub fn attach(&self, terminal: &str, cols: u16, rows: u16, display: Value) -> Result<Attached> {
-        let result = self.call(
+    fn attach(&self, terminal: &str, cols: u16, rows: u16, display: Value) -> Result<Attached> {
+        let result = self.call_timeout(
             "terminal.attach",
             json!({"terminal": terminal, "cols": cols, "rows": rows, "history": 2000, "display": display}),
+            Duration::from_secs(10),
         )?;
         let channel = result["channel"].as_u64().ok_or_else(|| anyhow!("attach returned no channel"))? as u32;
-        let (tx, rx) = async_channel::unbounded();
-        let mut r = self.routes.lock().unwrap();
-        for item in r.early.remove(&channel).unwrap_or_default() {
-            let _ = tx.try_send(item);
-        }
-        r.streams.insert(channel, tx);
-        Ok(Attached { channel, stream: rx, terminal: result["terminal"].clone() })
+        Ok(Attached { channel, stream: self.route(channel), terminal: result["terminal"].clone() })
     }
 
-    pub fn input(&self, channel: u32, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.send(channel, DATA, bytes);
-        }
+    fn input(&self, channel: u32, bytes: &[u8]) {
+        self.send(channel, DATA, bytes);
     }
 
-    pub fn credit(&self, channel: u32, n: usize) {
+    fn reply(&self, channel: u32, bytes: &[u8]) {
+        self.send(channel, DATA, bytes);
+    }
+
+    fn credit(&self, channel: u32, n: usize) {
         self.send(channel, CREDIT, &(n as u32).to_le_bytes());
     }
 
-    pub fn resize(&self, channel: u32, cols: u16, rows: u16) {
+    fn resize(&self, channel: u32, cols: u16, rows: u16) {
         let mut p = cols.to_le_bytes().to_vec();
         p.extend(rows.to_le_bytes());
         self.send(channel, RESIZE, &p);
     }
 
-    pub fn focus(&self, channel: u32, focused: bool) {
+    fn focus(&self, channel: u32, focused: bool) {
         self.send(channel, FOCUS, &[focused as u8]);
     }
 
-    pub fn detach(&self, channel: u32) {
+    fn detach(&self, channel: u32) {
         self.routes.lock().unwrap().streams.remove(&channel);
         self.send(channel, CLOSE, &[]);
     }
 }
 
-impl Drop for Core {
+impl Drop for HcLink {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
@@ -497,18 +569,13 @@ mod tests {
         let (writer, _frames) = mpsc::channel();
         let (_lost_tx, lost) = async_channel::bounded(1);
         let child = std::process::Command::new(std::env::current_exe().unwrap()).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-        let core = Core {
-            hello: Value::Null,
-            writer,
-            routes: Arc::new(Mutex::new(Routes { closed: true, ..Default::default() })),
-            next_id: AtomicU64::new(1),
-            child: Mutex::new(child),
-            lost,
-        };
+        let routes = Arc::new(Mutex::new(Routes { closed: true, ..Default::default() }));
+        let link = HcLink { writer, routes: routes.clone(), next_id: AtomicU64::new(1), child: Mutex::new(child), lost };
+        let core = Core::new(Value::Null, Kind::Herdr, Box::new(link));
         let start = std::time::Instant::now();
         assert!(core.call("doc.get", json!({"name":"herdr-app"})).unwrap_err().to_string().contains("lost the core"));
         assert!(start.elapsed() < Duration::from_secs(1));
-        assert!(core.routes.lock().unwrap().replies.is_empty());
+        assert!(routes.lock().unwrap().replies.is_empty());
     }
 
     fn hello(generation: u64, version: &str, methods: &[&str]) -> Value {

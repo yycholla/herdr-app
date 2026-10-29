@@ -35,6 +35,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fancy-regex = "0.19"
 notify = "7"
 sha2 = "0.10"
+# Rex backend (src/rex): its control and data connections are WebSockets over
+# a Unix socket, or TLS for a remote server.
+tungstenite = "0.29"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+url = "2"
 
 [[test]]
 name = "shot_pixels"

@@ -21,6 +21,7 @@ mod macos;
 mod mods;
 mod mod_files;
 mod process_cwd;
+mod rex;
 mod programs;
 mod settings;
 mod setup;
@@ -117,7 +118,12 @@ fn main() {
     // The core people installed; without one, the setup screen installs it.
     let person = settings::load_person();
     let configured = person.as_ref().ok().and_then(|p| p.core.clone());
-    let core: Result<std::sync::Arc<hc::Core>, setup::Need> = match core_bin::find(configured.as_deref()) {
+    let rex = (settings::backend() == hc::Kind::Rex).then(|| {
+        rex::connect().inspect_err(|e| eprintln!("herdr-app: Rex: {e:#}; using herdr-core"))
+    });
+    let core: Result<std::sync::Arc<hc::Core>, setup::Need> = match rex {
+        Some(Ok(core)) => Ok(core),
+        _ => match core_bin::find(configured.as_deref()) {
         None => Err(setup::Need::Install),
         Some(bin) => {
             core_bin::use_core(bin);
@@ -130,6 +136,7 @@ fn main() {
                 }
             }
         }
+        },
     };
     #[cfg(target_os = "macos")]
     core_bin::install_cli_link();

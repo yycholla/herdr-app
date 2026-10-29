@@ -62,7 +62,7 @@ impl Setup {
     /// Connects to the core; if it serves this app, closes this window and
     /// opens the main one, else says what's still needed.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match Core::connect() {
+        match Core::connect_chosen() {
             Ok(core) => match crate::hc::check(&core.hello) {
                 Ok(()) => {
                     let Some(requests) = self.requests.take() else { return };

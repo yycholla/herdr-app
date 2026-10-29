@@ -124,6 +124,9 @@ struct Shared {
     replies: Vec<u8>,
     clipboard_write: bool,
     clipboard: [Option<String>; 2],
+    /// Kitty images may load from local files and shared memory. Off for a
+    /// program that runs elsewhere (Rex): it mustn't read this machine's files.
+    local_media: bool,
 }
 
 /// One kitty graphics image on screen, in cells of the viewport.
@@ -322,6 +325,128 @@ const SCROLLBACK_MAX_BYTES: usize = 10_000_000;
 /// Units per pixel for selection gestures (see `select`).
 const SUBPIXEL: f32 = 64.0;
 
+/// Points a terminal's callbacks at `shared` and sets Herdr's limits: what
+/// every terminal a `Vt` owns needs (a new one, and one from a snapshot).
+unsafe fn configure(term: GhosttyTerminal, shared: &mut Box<Shared>) {
+    unsafe {
+        let ud = &mut **shared as *mut Shared as *const c_void;
+        ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_USERDATA, ud);
+        let hold: GhosttyTerminalRenderHoldFn = Some(on_render_hold);
+        ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, std::mem::transmute::<GhosttyTerminalRenderHoldFn, *const c_void>(hold));
+        let title: GhosttyTerminalTitleChangedFn = Some(on_title);
+        ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, std::mem::transmute::<GhosttyTerminalTitleChangedFn, *const c_void>(title));
+        let write: GhosttyTerminalWritePtyFn = Some(on_write_pty);
+        ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, std::mem::transmute::<GhosttyTerminalWritePtyFn, *const c_void>(write));
+        let clipboard: GhosttyTerminalClipboardWriteFn = Some(on_clipboard_write);
+        ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE, std::mem::transmute::<GhosttyTerminalClipboardWriteFn, *const c_void>(clipboard));
+        let max_clipboard: usize = MAX_CLIPBOARD_BYTES;
+        ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES, &max_clipboard as *const _ as *const c_void);
+        // No read callback: programs can never read the local clipboard.
+        let images: u64 = 128 << 20;
+        ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &images as *const _ as *const c_void);
+        ok(ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &SCROLLBACK_MAX_BYTES as *const _ as *const c_void), "scrollback_max_bytes");
+        ok(ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &SCROLLBACK_MAX_LINES as *const _ as *const c_void), "scrollback_max_lines");
+        if !shared.local_media {
+            let off = false;
+            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE, &off as *const _ as *const c_void);
+            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, std::ptr::null());
+            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, &off as *const _ as *const c_void);
+        }
+    }
+}
+
+/// Snapshot records this Ghostty decodes (TERMINAL through CONTINUATION).
+/// Newer encoders add optional ones (Kitty graphics: 8 to 10) that newer
+/// decoders skip once their checksum holds; this one refuses them instead.
+const SNAPSHOT_TAGS: std::ops::RangeInclusive<u16> = 1..=7;
+const SNAPSHOT_FINISH: u16 = 6;
+/// What a snapshot may take to import (Rex's own bound).
+const MAX_SNAPSHOT_BYTES: usize = 64 << 20;
+/// What a snapshot's screen may hold.
+const MAX_SNAPSHOT_CELLS: usize = 65_536;
+
+/// The snapshot with records of unknown tags left out, as newer Ghostty
+/// decoders skip them: each is checked (CRC32C) first, so a damaged one still
+/// fails. Known records stay byte for byte, for Ghostty to validate.
+fn known_snapshot_records(bytes: &[u8]) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+    use anyhow::{Context, ensure};
+    ensure!(bytes.len() <= MAX_SNAPSHOT_BYTES, "the snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes");
+    ensure!(bytes.len() >= 10 && &bytes[..8] == b"GHOSTSNP", "not a Ghostty snapshot");
+    let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+    ensure!(version == 1, "unsupported Ghostty snapshot version {version}");
+    let mut known: Option<Vec<u8>> = None;
+    let mut at = 10;
+    loop {
+        ensure!(bytes.len() - at >= 10, "truncated snapshot record");
+        let header = &bytes[at..at + 10];
+        let tag = u16::from_le_bytes([header[0], header[1]]);
+        let len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        let end = (at + 10).checked_add(len).filter(|end| *end <= bytes.len()).context("truncated snapshot record")?;
+        if SNAPSHOT_TAGS.contains(&tag) {
+            if let Some(known) = &mut known {
+                known.extend_from_slice(&bytes[at..end]);
+            }
+        } else {
+            let crc = u32::from_le_bytes([header[6], header[7], header[8], header[9]]);
+            ensure!(crc32c(&[&header[..6], &bytes[at + 10..end]]) == crc, "snapshot record {tag} fails its checksum");
+            known.get_or_insert_with(|| bytes[..at].to_vec());
+        }
+        at = end;
+        if tag == SNAPSHOT_FINISH {
+            break;
+        }
+    }
+    ensure!(at == bytes.len(), "bytes follow the snapshot's FINISH");
+    Ok(known.map_or(std::borrow::Cow::Borrowed(bytes), std::borrow::Cow::Owned))
+}
+
+/// CRC32C (Castagnoli), as Ghostty's snapshot records use.
+fn crc32c(parts: &[&[u8]]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut v = i as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                v = if v & 1 == 0 { v >> 1 } else { (v >> 1) ^ 0x82f6_3b78 };
+                bit += 1;
+            }
+            table[i] = v;
+            i += 1;
+        }
+        table
+    };
+    let mut crc = u32::MAX;
+    for b in parts.iter().flat_map(|p| p.iter()) {
+        crc = (crc >> 8) ^ TABLE[((crc ^ u32::from(*b)) & 0xff) as usize];
+    }
+    !crc
+}
+
+/// Restores a terminal from a whole snapshot with Ghostty's decoder, which
+/// validates every record (checksums, order, counts, contents).
+fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<GhosttyTerminal> {
+    unsafe {
+        let mut decoder: GhosttySnapshotDecoder = std::ptr::null_mut();
+        let r = ghostty_snapshot_decoder_new_buf(std::ptr::null(), &mut decoder, bytes.as_ptr(), bytes.len());
+        anyhow::ensure!(r == GHOSTTY_SUCCESS && !decoder.is_null(), "cannot start decoding the snapshot ({r})");
+        let mut term: GhosttyTerminal = std::ptr::null_mut();
+        let r = ghostty_snapshot_decoder_decode(decoder, &mut term);
+        let mut used = 0usize;
+        let offset = ghostty_snapshot_decoder_get(decoder, GHOSTTY_SNAPSHOT_DECODER_DATA_SOURCE_OFFSET, &mut used as *mut _ as *mut c_void);
+        ghostty_snapshot_decoder_free(decoder);
+        if r != GHOSTTY_SUCCESS || term.is_null() {
+            anyhow::bail!("invalid snapshot ({r})");
+        }
+        if offset != GHOSTTY_SUCCESS || used != bytes.len() {
+            ghostty_terminal_free(term);
+            anyhow::bail!("the snapshot decoder stopped at byte {used} of {}", bytes.len());
+        }
+        Ok(term)
+    }
+}
+
 impl Vt {
     pub fn new(cols: u16, rows: u16) -> Vt {
         unsafe {
@@ -343,29 +468,12 @@ impl Vt {
             ok(ghostty_mouse_event_new(std::ptr::null(), &mut mouse_event), "mouse_event_new");
 
             install_png_decoder();
-            let mut shared = Box::new(Shared { state, held_since: None, title_changed: false, replies: Vec::new(), clipboard_write: true, clipboard: [None, None] });
-            let ud = &mut *shared as *mut Shared as *const c_void;
-            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_USERDATA, ud);
-            let hold: GhosttyTerminalRenderHoldFn = Some(on_render_hold);
-            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, std::mem::transmute(hold));
-            let title: GhosttyTerminalTitleChangedFn = Some(on_title);
-            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, std::mem::transmute(title));
-            let write: GhosttyTerminalWritePtyFn = Some(on_write_pty);
-            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, std::mem::transmute(write));
-            let clipboard: GhosttyTerminalClipboardWriteFn = Some(on_clipboard_write);
-            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE, std::mem::transmute::<GhosttyTerminalClipboardWriteFn, *const c_void>(clipboard));
-            let max_clipboard: usize = MAX_CLIPBOARD_BYTES;
-            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES, &max_clipboard as *const _ as *const c_void);
-            // No read callback: programs can never read the local clipboard.
-            let images: u64 = 128 << 20;
-            ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &images as *const _ as *const c_void);
+            let mut shared = Box::new(Shared { state, held_since: None, title_changed: false, replies: Vec::new(), clipboard_write: true, clipboard: [None, None], local_media: true });
+            configure(term, &mut shared);
 
             ghostty_render_state_update(state, term);
             let mut colors = GhosttyRenderStateColors { size: std::mem::size_of::<GhosttyRenderStateColors>(), ..Default::default() };
             ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_COLORS, &mut colors as *mut _ as *mut c_void);
-
-            ok(ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &SCROLLBACK_MAX_BYTES as *const _ as *const c_void), "scrollback_max_bytes");
-            ok(ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &SCROLLBACK_MAX_LINES as *const _ as *const c_void), "scrollback_max_lines");
 
             let mut gesture = std::ptr::null_mut();
             ok(ghostty_selection_gesture_new(std::ptr::null(), &mut gesture), "selection_gesture_new");
@@ -718,6 +826,72 @@ impl Vt {
 
     pub fn clear_selection(&mut self) {
         unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, std::ptr::null()) };
+    }
+
+    /// Replaces the terminal with a Rex snapshot (Ghostty `GHOSTSNP` v1, the
+    /// whole stream up to and including FINISH): its screens, history, modes,
+    /// title and unfinished VT input. Later `write`s continue from it. The
+    /// size becomes the snapshot's; this view's colors, callbacks and limits
+    /// stay (and its cell size, when the snapshot has none). On an error the
+    /// terminal is left as it was.
+    ///
+    /// Kitty graphics records are skipped (their checksums still checked):
+    /// this Ghostty can't decode them, so images from before the snapshot
+    /// don't show.
+    pub fn import_snapshot(&mut self, snapshot: &[u8]) -> anyhow::Result<()> {
+        let records = known_snapshot_records(snapshot)?;
+        let term = decode_snapshot(&records)?;
+        let (cols, rows) = unsafe {
+            let get_u16 = |data| {
+                let mut v = 0u16;
+                ghostty_terminal_get(term, data, &mut v as *mut _ as *mut c_void);
+                v
+            };
+            let (cols, rows) = (get_u16(GHOSTTY_TERMINAL_DATA_COLS), get_u16(GHOSTTY_TERMINAL_DATA_ROWS));
+            let mut state = std::ptr::null_mut();
+            if cols == 0 || rows == 0 || cols as usize * rows as usize > MAX_SNAPSHOT_CELLS || ghostty_render_state_new(std::ptr::null(), &mut state) != GHOSTTY_SUCCESS {
+                ghostty_terminal_free(term);
+                anyhow::bail!("cannot show a {cols}x{rows} snapshot");
+            }
+            let px = |t, data| {
+                let mut v = 0u32;
+                ghostty_terminal_get(t, data, &mut v as *mut _ as *mut c_void);
+                v
+            };
+            if px(term, GHOSTTY_TERMINAL_DATA_WIDTH_PX) == 0 || px(term, GHOSTTY_TERMINAL_DATA_HEIGHT_PX) == 0 {
+                // Before the callbacks are set, so a program that asked for
+                // size reports gets none from the display.
+                let cell_w = px(self.term, GHOSTTY_TERMINAL_DATA_WIDTH_PX) / u32::from(self.cols.max(1));
+                let cell_h = px(self.term, GHOSTTY_TERMINAL_DATA_HEIGHT_PX) / u32::from(self.rows.max(1));
+                ghostty_terminal_resize(term, cols, rows, cell_w.max(1), cell_h.max(1));
+            }
+            configure(term, &mut self.shared);
+            // The gesture holds references into the terminal it was used with.
+            ghostty_selection_gesture_reset(self.gesture, self.term);
+            ghostty_terminal_free(self.term);
+            ghostty_render_state_free(self.shared.state);
+            self.term = term;
+            self.shared.state = state;
+            (cols, rows)
+        };
+        self.shared.held_since = None;
+        // The snapshot carries the program's title.
+        self.shared.title_changed = true;
+        (self.cols, self.rows) = (cols, rows);
+        self.apply_theme();
+        self.seen.clear();
+        self.seen_with = (0, 0);
+        self.drawn = Default::default();
+        // What it learned from the old terminal's bytes says nothing of this one.
+        self.win32 = Default::default();
+        Ok(())
+    }
+
+    /// Kitty images load only from the stream itself, never from this
+    /// machine's files or shared memory (kept across `import_snapshot`).
+    pub fn deny_local_media(&mut self) {
+        self.shared.local_media = false;
+        unsafe { configure(self.term, &mut self.shared) };
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -1096,6 +1270,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_remote_programs_terminal_never_loads_images_from_local_files() {
+        let medium = |vt: &Vt| unsafe {
+            let (mut file, mut shm) = (true, true);
+            ghostty_terminal_get(vt.term, GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE, &mut file as *mut _ as *mut c_void);
+            ghostty_terminal_get(vt.term, GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_SHARED_MEM, &mut shm as *mut _ as *mut c_void);
+            (file, shm)
+        };
+        let mut vt = Vt::new(20, 5);
+        vt.deny_local_media();
+        assert_eq!(medium(&vt), (false, false));
+        // A file transmission is refused, and nothing is displayed.
+        vt.write(b"\x1b_Ga=T,t=f,f=100;L2V0Yy9wYXNzd2Q=\x1b\\");
+        assert!(vt.placements().is_empty());
+    }
+
+    #[test]
     fn scrollback_retains_five_thousand_styled_lines() {
         for cols in [80, 200] {
             let mut vt = Vt::new(cols, 25);
@@ -1382,5 +1572,135 @@ mod tests {
         vt.write(b"\x1b]2;hello\x07");
         assert_eq!(vt.take_title().as_deref(), Some("hello"));
         assert_eq!(vt.take_title(), None);
+    }
+
+    fn snapshot_of(vt: &Vt) -> Vec<u8> {
+        unsafe {
+            let (mut ptr, mut len) = (std::ptr::null_mut(), 0usize);
+            ok(ghostty_snapshot_encode_alloc(vt.term, std::ptr::null(), &mut ptr, &mut len), "snapshot_encode_alloc");
+            let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+            ghostty_free(std::ptr::null(), ptr, len);
+            bytes
+        }
+    }
+
+    fn lines(f: &Frame) -> Vec<String> {
+        f.rows.iter().map(|r| r.iter().map(|c| if c.text.is_empty() && !c.wide { " " } else { c.text.as_str() }).collect::<String>().trim_end().to_owned()).collect()
+    }
+
+    /// A record of an unknown tag, as newer encoders add (Kitty graphics).
+    fn unknown_record(tag: u16, payload: &[u8]) -> Vec<u8> {
+        let mut header = tag.to_le_bytes().to_vec();
+        header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let crc = crc32c(&[&header, payload]);
+        [header, crc.to_le_bytes().to_vec(), payload.to_vec()].concat()
+    }
+
+    #[test]
+    fn crc32c_matches_the_standard_check_value() {
+        assert_eq!(crc32c(&[b"1234", b"56789"]), 0xe306_9283);
+    }
+
+    #[test]
+    fn a_snapshot_restores_the_screen_size_cursor_and_history() {
+        let mut source = Vt::new(30, 5);
+        // Unfinished input is carried only while tracked.
+        let track: usize = 1 << 16;
+        unsafe { ghostty_terminal_set(source.term, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES, &track as *const _ as *const c_void) };
+        for i in 0..20 {
+            source.write(format!("history {i}\r\n").as_bytes());
+        }
+        source.write(b"\x1b]2;remote title\x07plain \x1b[1;31mred\x1b[0m\r\n\xe4\xb8\xad wide\x1b[5;12Hend\x1b[3;4H\x1b[1;3");
+        let before = source.frame();
+        let bytes = snapshot_of(&source);
+
+        let mut vt = Vt::new(10, 3);
+        vt.write(b"old screen");
+        vt.take_title();
+        vt.import_snapshot(&bytes).unwrap();
+        assert_eq!((vt.cols, vt.rows), (30, 5));
+        let after = vt.frame();
+        assert!(after.all);
+        assert_eq!(lines(&after), lines(&before));
+        assert_eq!(lines(&after)[3], "plain red");
+        assert_eq!(lines(&after)[4], "中  wide    end");
+        let red = &after.rows[3][6];
+        assert!(red.bold);
+        assert_eq!(red.fg, theme().palette16[1]);
+        assert!(after.rows[4][0].wide);
+        let (c, b) = (after.cursor.unwrap(), before.cursor.unwrap());
+        assert_eq!((c.x, c.y), (b.x, b.y));
+        assert_eq!((c.x, c.y), (3, 2));
+        assert_eq!(vt.take_title().as_deref(), Some("remote title"));
+        // The unfinished SGR continues from the snapshot.
+        vt.write(b"2mX");
+        let f = vt.frame();
+        assert_eq!(f.rows[2][3].text, "X");
+        assert!(f.rows[2][3].bold);
+        assert_eq!(f.rows[2][3].fg, theme().palette16[2]);
+        // History came along.
+        vt.scroll_viewport(-100);
+        assert_eq!(lines(&vt.frame())[0], "history 0");
+        // And the callbacks: a device query is answered.
+        vt.scroll_to_bottom();
+        vt.write(b"\x1b[6n");
+        assert_eq!(vt.take_replies(), b"\x1b[3;5R");
+        vt.write(b"\x1b]2;next\x07");
+        assert_eq!(vt.take_title().as_deref(), Some("next"));
+        // The view's colors stay.
+        vt.set_theme(Theme { fg: Rgb(1, 2, 3), ..theme() });
+        vt.write(b"\x1b[0m\r\nZ");
+        let f = vt.frame();
+        assert_eq!(f.rows[3][0].text, "Z");
+        assert_eq!(f.rows[3][0].fg, readable(Rgb(1, 2, 3), theme().bg));
+    }
+
+    #[test]
+    fn records_of_unknown_tags_are_skipped_once_checked() {
+        let mut source = Vt::new(20, 3);
+        source.write(b"kept");
+        let bytes = snapshot_of(&source);
+        // Before FINISH, as Kitty graphics records come.
+        let finish = bytes.len() - 10;
+        let with = [&bytes[..finish], &unknown_record(9, b"pixels"), &unknown_record(0x4000, b""), &bytes[finish..]].concat();
+        let mut vt = Vt::new(20, 3);
+        vt.import_snapshot(&with).unwrap();
+        assert_eq!(lines(&vt.frame())[0], "kept");
+
+        let mut damaged = unknown_record(8, b"meta");
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        let bad = [&bytes[..finish], &damaged, &bytes[finish..]].concat();
+        assert!(Vt::new(20, 3).import_snapshot(&bad).is_err());
+    }
+
+    #[test]
+    fn a_bad_snapshot_leaves_the_terminal_as_it_was() {
+        let mut source = Vt::new(20, 3);
+        source.write(b"from the snapshot");
+        let bytes = snapshot_of(&source);
+        let mut vt = Vt::new(12, 4);
+        vt.write(b"still here");
+        let before = lines(&vt.frame());
+
+        let mut corrupt = bytes.clone();
+        let mid = 10 + 10 + 5; // inside TERMINAL's payload
+        corrupt[mid] ^= 0x40;
+        let mut trailing = bytes.clone();
+        trailing.push(b'x');
+        let mut unfinished = bytes.clone();
+        unfinished.truncate(bytes.len() - 10);
+        let mut version = bytes.clone();
+        version[8] = 2;
+        for bad in [&corrupt[..], &trailing, &unfinished, &version, &bytes[..9], b""] {
+            assert!(vt.import_snapshot(bad).is_err());
+            assert_eq!((vt.cols, vt.rows), (12, 4));
+            assert_eq!(lines(&vt.frame()), before);
+        }
+        vt.write(b"!");
+        assert_eq!(lines(&vt.frame())[0], "still here!");
+        // And a good one still imports.
+        vt.import_snapshot(&bytes).unwrap();
+        assert_eq!(lines(&vt.frame())[0], "from the snapshot");
     }
 }

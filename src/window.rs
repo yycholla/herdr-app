@@ -674,9 +674,12 @@ impl AppWindow {
                 core.closed().await;
                 tracing::warn!("lost the core; reconnecting");
                 crate::telemetry::count("core_lost");
+                // The same backend again: switching is app.backend's (a restart).
+                let kind = core.kind;
+                drop(core);
                 let fresh = loop {
                     cx.background_executor().timer(Duration::from_millis(1000)).await;
-                    if let Ok(core) = cx.background_executor().spawn(async { Core::connect() }).await {
+                    if let Ok(core) = cx.background_executor().spawn(async move { Core::connect_kind(kind) }).await {
                         break core;
                     }
                 };
@@ -3080,6 +3083,28 @@ impl AppWindow {
                 return;
             }
             "app.check_updates" => crate::update::check_now(),
+            "app.backend" => {
+                let backend = match Self::arg(a, "backend") {
+                    Some("rex") => settings::Backend::Rex,
+                    Some("herdr-core" | "herdr" | "hc") => settings::Backend::Herdr,
+                    other => return self.fail(format!("no backend {other:?}: \"herdr-core\" or \"rex\"")),
+                };
+                let now = match self.core.kind {
+                    crate::hc::Kind::Herdr => settings::Backend::Herdr,
+                    crate::hc::Kind::Rex => settings::Backend::Rex,
+                };
+                if backend == now {
+                    return;
+                }
+                if settings::load_person().is_err() {
+                    return self.fail("settings.json can't be read: fix it before switching backends");
+                }
+                self.write_person(|p| p.backend = backend, window, cx);
+                // A window holds one backend's spaces and panes: start over on the other.
+                self.drain_documents(window, cx);
+                crate::update::restart();
+                cx.quit();
+            }
             "app.update_core" => {
                 if crate::update::core().ready.is_none() && crate::update::core().error.is_none() {
                     return self.fail("herdr-core is up to date");
