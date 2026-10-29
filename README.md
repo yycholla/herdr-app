@@ -1,5 +1,7 @@
 # Herdr
 
+A vibe slop fork of herdr-app adding Rex server connection.
+
 Herdr is a desktop app for terminals and coding agents. Keep work in spaces, see which agents need you, and leave terminals running when you close the window.
 
 ## Install
