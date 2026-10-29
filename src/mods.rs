@@ -770,15 +770,15 @@ pub fn run_on(machine: &str, command: &str, args: &[String]) -> Option<String> {
 }
 
 /// The agents a machine can start (`knownAgents()`), asked at most once a minute.
-fn known_agents(on: Option<String>) -> Value {
-    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<Option<String>, (std::time::Instant, Vec<String>)>>> = std::sync::Mutex::new(None);
-    let list = crate::programs::startable();
-    let cached = SEEN.lock().ok().and_then(|s| s.as_ref()?.get(&on).filter(|(at, _)| at.elapsed().as_secs() < 60).map(|(_, v)| v.clone()));
+fn known_agents(on: Option<String>, list: Vec<Value>) -> Value {
+    type InstalledCache = std::collections::HashMap<Option<String>, (std::time::Instant, Vec<String>, Vec<String>)>;
+    static SEEN: std::sync::Mutex<Option<InstalledCache>> = std::sync::Mutex::new(None);
+    let commands: Vec<String> = list.iter().filter_map(|a| a["run"][0].as_str().map(str::to_owned)).collect();
+    let cached = SEEN.lock().ok().and_then(|s| s.as_ref()?.get(&on).filter(|(at, checked, _)| at.elapsed().as_secs() < 60 && checked == &commands).map(|(_, _, v)| v.clone()));
     let have = cached.unwrap_or_else(|| {
-        let commands: Vec<String> = list.iter().filter_map(|a| a["run"][0].as_str().map(str::to_owned)).collect();
         let found = crate::programs::installed(&commands, on.as_deref());
         if let Ok(mut s) = SEEN.lock() {
-            s.get_or_insert_with(std::collections::HashMap::new).insert(on.clone(), (std::time::Instant::now(), found.clone()));
+            s.get_or_insert_with(std::collections::HashMap::new).insert(on.clone(), (std::time::Instant::now(), commands, found.clone()));
         }
         found
     });
@@ -911,9 +911,11 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         })
         .async_function("knownAgents", |a| {
             let on = opt_str(a.get(0), "on");
+            // The table is loaded on the window thread; workers have only defaults.
+            let list = crate::programs::startable();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let _ = tx.send_blocking(known_agents(on));
+                let _ = tx.send_blocking(known_agents(on, list));
             });
             Ok(async move { Ok(to_host(&rx.recv().await.unwrap_or(Value::Array(Vec::new())))) })
         })
@@ -1130,6 +1132,21 @@ pub fn prepare_load(inst: &Instance) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn known_agents_uses_snapshot_and_refreshes_changed_commands() {
+        let snapshot = vec![json!({"key": "claude", "run": ["herdr_issue57_not_installed"]})];
+        let first = std::thread::spawn(move || known_agents(None, snapshot)).join().unwrap();
+        assert_eq!(first[0]["run"], json!(["herdr_issue57_not_installed"]));
+        assert_eq!(first[0]["installed"], false);
+        let snapshot = vec![json!({"key": "claude", "run": ["printf"]}), json!({"key": "claude-alt", "run": ["printf"]})];
+        let next = std::thread::spawn(move || known_agents(None, snapshot)).join().unwrap();
+        assert_eq!(next.as_array().unwrap().len(), 2);
+        assert_eq!(next[0]["installed"], true);
+        assert_eq!(next[1]["key"], "claude-alt");
+        assert_eq!(next[1]["installed"], true);
+    }
 
     #[test]
     fn shared_bursts_persist_only_complete_snapshots_and_finish_at_final_state() {

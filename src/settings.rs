@@ -36,7 +36,7 @@ const GRAPHITE: Palette = Palette {
     cursor: None,
     status: DARK_STATUS,
     ansi: [
-        0x282b32, 0xdc8c95, 0xa6bd91, 0xd8be87, 0x96b2d7, 0xb5a2ce, 0x8cbdc3, 0xd2d4d9, 0x818793, 0xf0a5ad, 0xbad5a2, 0xead2a1, 0xb0cbef,
+        0x45484f, 0xdc8c95, 0xa6bd91, 0xd8be87, 0x96b2d7, 0xb5a2ce, 0x8cbdc3, 0xd2d4d9, 0x818793, 0xf0a5ad, 0xbad5a2, 0xead2a1, 0xb0cbef,
         0xcbb7e6, 0xa4d5db, 0xf0f0f2,
     ],
 };
@@ -47,7 +47,7 @@ const INK: Palette = Palette {
     cursor: None,
     status: DARK_STATUS,
     ansi: [
-        0x253041, 0xe58c9a, 0x89c5aa, 0xd9be82, 0x91b6ee, 0xb9a0e2, 0x85c4d0, 0xcdd6e4, 0x7f91a7, 0xf5a5b2, 0xa5dec3, 0xedd39c, 0xaccbfa,
+        0x414b5a, 0xe58c9a, 0x89c5aa, 0xd9be82, 0x91b6ee, 0xb9a0e2, 0x85c4d0, 0xcdd6e4, 0x7f91a7, 0xf5a5b2, 0xa5dec3, 0xedd39c, 0xaccbfa,
         0xd0b7f4, 0xa0dce5, 0xf0f5fc,
     ],
 };
@@ -58,7 +58,7 @@ const MOSS: Palette = Palette {
     cursor: None,
     status: DARK_STATUS,
     ansi: [
-        0x29362f, 0xdf978d, 0xa0c4a2, 0xd4bc8b, 0x99b9cd, 0xbba4c8, 0x8bbdb5, 0xcdd7ce, 0x82968a, 0xf1afa3, 0xb8dab9, 0xe9d2a5, 0xb1d0e2,
+        0x435248, 0xdf978d, 0xa0c4a2, 0xd4bc8b, 0x99b9cd, 0xbba4c8, 0x8bbdb5, 0xcdd7ce, 0x82968a, 0xf1afa3, 0xb8dab9, 0xe9d2a5, 0xb1d0e2,
         0xd1bddc, 0xa4d6ca, 0xeff5ee,
     ],
 };
@@ -117,12 +117,62 @@ fn theme_path(name: &str) -> std::path::PathBuf {
     crate::mods::app_dir().join("themes").join(format!("{name}.json"))
 }
 
+// Only these exact shipped versions may be replaced; personal themes stay intact.
+const PREVIOUS_THEMES: &[(&str, &str)] = &[
+    ("atom-one-dark", r##"{
+  "background": "#21252b",
+  "foreground": "#abb2bf",
+  "selection": "#323844",
+  "cursor": "#abb2bf",
+  "ansi": [
+    "#21252b", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+    "#767676", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#abb2bf"
+  ]
+}
+"##),
+    ("win98", r##"{
+  "background": "#ffffff",
+  "foreground": "#c0c0c0",
+  "selection": "#000080",
+  "cursor": "#c0c0c0",
+  "ansi": [
+    "#000000", "#aa0000", "#00aa00", "#aa5500", "#0000aa", "#aa00aa", "#00aaaa", "#aaaaaa",
+    "#555555", "#ff5555", "#55ff55", "#ffff55", "#5555ff", "#ff55ff", "#55ffff", "#ffffff"
+  ],
+  "colors": {
+    "foreground": "#000000",
+    "surface": "#c0c0c0",
+    "popover": "#c0c0c0",
+    "raised": "#dfdfdf",
+    "hover": "#dfdfdf",
+    "border": "#808080",
+    "input": "#ffffff",
+    "muted": "#404040",
+    "dim": "#808080",
+    "accent": "#000080",
+    "accent_foreground": "#ffffff",
+    "ring": "#000000",
+    "working": "#808000",
+    "blocked": "#ff0000",
+    "done": "#0000ff",
+    "idle": "#808080",
+    "unknown": "#808080"
+  }
+}
+"##),
+];
+
 pub fn install_themes() {
     let _ = std::fs::create_dir_all(crate::mods::app_dir().join("themes"));
     for (name, text) in THEMES {
-        if !theme_path(name).exists() {
-            let _ = std::fs::write(theme_path(name), text);
-        }
+        install_theme(&theme_path(name), name, text);
+    }
+}
+
+fn install_theme(path: &std::path::Path, name: &str, text: &str) {
+    let previous = PREVIOUS_THEMES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
+    if !path.exists() || std::fs::read_to_string(path).ok().as_deref().is_some_and(|s| Some(s) == previous) {
+        let _ = crate::persist::write_atomic(path, text.as_bytes());
     }
 }
 
@@ -162,6 +212,27 @@ fn parse_theme_file(name: &str, text: &str) -> Result<(Palette, BTreeMap<String,
         status: None,
     };
     Ok((p, f.colors))
+}
+
+#[test]
+fn shipped_theme_upgrades_preserve_personal_edits() {
+    let root = std::env::temp_dir().join(format!("herdr-theme-upgrades-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    for (name, previous) in PREVIOUS_THEMES {
+        let path = root.join(format!("{name}.json"));
+        let current = THEMES.iter().find(|(n, _)| n == name).unwrap().1;
+        install_theme(&path, name, current);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), current);
+        std::fs::write(&path, previous).unwrap();
+        install_theme(&path, name, current);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), current);
+        let edited = previous.replace("#abb2bf", "#abcdef").replace("#c0c0c0", "#abcdef");
+        std::fs::write(&path, &edited).unwrap();
+        install_theme(&path, name, current);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        std::fs::remove_file(&path).unwrap();
+    }
+    std::fs::remove_dir(root).unwrap();
 }
 
 #[test]
@@ -323,6 +394,11 @@ pub struct Person {
     /// Allow terminal programs (including remote ones) to copy text locally.
     #[serde(skip_serializing_if = "is_true")]
     pub clipboard_write: bool,
+    /// Minimum terminal text contrast ratio; 1 leaves program colors unchanged.
+    pub minimum_contrast: f32,
+    /// macOS Option sends Alt shortcuts, or follows the keyboard layout.
+    #[serde(skip_serializing_if = "OptionAsAlt::is_auto")]
+    pub option_as_alt: OptionAsAlt,
     /// Light or dark: the system's, or one always.
     #[serde(skip_serializing_if = "Appearance::is_system")]
     pub appearance: Appearance,
@@ -375,6 +451,21 @@ impl Appearance {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OptionAsAlt {
+    #[default]
+    Auto,
+    Off,
+    On,
+}
+
+impl OptionAsAlt {
+    fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
@@ -392,6 +483,8 @@ impl Default for Person {
             ui_font: None,
             telemetry: true,
             clipboard_write: true,
+            minimum_contrast: 1.0,
+            option_as_alt: OptionAsAlt::Auto,
             appearance: Appearance::System,
             theme: None,
             colors: BTreeMap::new(),
@@ -424,6 +517,8 @@ pub struct Settings {
     /// 0..1: below 1, what's behind a terminal shows through.
     pub terminal_opacity: f32,
     pub clipboard_write: bool,
+    pub minimum_contrast: f32,
+    pub option_as_alt: OptionAsAlt,
     pub sounds: Sounds,
 }
 
@@ -462,6 +557,8 @@ impl Default for Settings {
             terminal_padding: [10.0, 6.0],
             terminal_opacity: 1.0,
             clipboard_write: true,
+            minimum_contrast: 1.0,
+            option_as_alt: OptionAsAlt::Auto,
             sounds: Sounds::default(),
         }
     }
@@ -497,6 +594,8 @@ impl Settings {
             terminal_opacity: look.terminal_opacity.unwrap_or(1.0).clamp(0.0, 1.0),
             sounds: person.sounds.clone(),
             clipboard_write: person.clipboard_write,
+            minimum_contrast: person.minimum_contrast,
+            option_as_alt: person.option_as_alt,
         }
     }
 }
@@ -540,6 +639,9 @@ impl Settings {
             if parse_hex(v).is_none() {
                 out.push(format!("colors.{k}: {v:?} is not #rrggbb or #rrggbbaa"));
             }
+        }
+        if !(1.0..=21.0).contains(&self.minimum_contrast) {
+            out.push(format!("minimum_contrast {} is outside 1..21", self.minimum_contrast));
         }
         if !(6.0..=72.0).contains(&self.font_size) {
             out.push(format!("font_size {} is outside 6..72", self.font_size));
@@ -611,6 +713,12 @@ pub fn write_person(person: &Person) -> std::io::Result<()> {
 
 /// Installs new settings; returns whether anything changed.
 pub fn set(s: Settings) -> bool {
+    #[cfg(target_os = "macos")]
+    gpui_macos::set_option_as_alt(match s.option_as_alt {
+        OptionAsAlt::Auto => None,
+        OptionAsAlt::Off => Some(false),
+        OptionAsAlt::On => Some(true),
+    });
     CURRENT.with(|c| {
         if *c.borrow().0 == s {
             return false;
@@ -774,6 +882,33 @@ mod tests {
         assert_eq!((own.font_family.as_str(), own.font_size, own.ui_font_family.as_str(), own.theme.as_str()), ("layout", 14.0, "layout-ui", "ink"));
         assert_eq!(own.colors["accent"], "#abcdef");
         assert_eq!(own.colors["text"], "#ffffff");
+    }
+
+    #[test]
+    fn option_as_alt_defaults_to_auto_and_round_trips() {
+        let default: Person = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.option_as_alt, OptionAsAlt::Auto);
+        for (value, expected) in [("auto", OptionAsAlt::Auto), ("off", OptionAsAlt::Off), ("on", OptionAsAlt::On)] {
+            let person: Person = serde_json::from_value(serde_json::json!({"option_as_alt": value})).unwrap();
+            let settings = Settings::compose(&person, &crate::layout::Look::default(), true);
+            assert_eq!(settings.option_as_alt, expected);
+            assert_eq!(serde_json::to_value(settings).unwrap()["option_as_alt"], value);
+        }
+        assert!(serde_json::from_value::<Person>(serde_json::json!({"option_as_alt": "left"})).is_err());
+    }
+
+    #[test]
+    fn minimum_contrast_defaults_off_and_validates_the_ratio() {
+        let default: Person = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.minimum_contrast, 1.0);
+        assert_eq!(Settings::default().minimum_contrast, 1.0);
+        for ratio in [1.0, 1.6, 21.0, 0.0, 21.1] {
+            let person: Person = serde_json::from_value(serde_json::json!({"minimum_contrast": ratio})).unwrap();
+            let settings = Settings::compose(&person, &crate::layout::Look::default(), true);
+            assert_eq!(settings.minimum_contrast, ratio);
+            assert_eq!(serde_json::to_value(person).unwrap()["minimum_contrast"], serde_json::json!(ratio));
+            assert_eq!(settings.problems().is_empty(), (1.0..=21.0).contains(&ratio));
+        }
     }
 
     #[test]

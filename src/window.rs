@@ -3862,14 +3862,14 @@ impl AppWindow {
                         }
                     }))
                 })
-                // Clicking a bar or a list in the layout (the ribbon, tabs, the sidebar)
-                // leaves the keyboard with the pane: the press would focus the mod's
-                // button or clear focus. Typing goes to overlays (pickers, prompts).
+                // Bare layout clicks leave the keyboard with the pane, but an input
+                // or other focusable control owns the keyboard once it takes focus.
                 .when(!in_overlay && !in_pane, |d| {
                     d.capture_any_mouse_down(cx.listener(|_, _, window, cx| {
                         cx.defer_in(window, |this, window, cx| {
                             let dialog = this.overlays.iter().any(|o| o.kind.modal_keys());
                             if !dialog
+                                && (window.focused(cx).is_none() || this.focus.is_focused(window))
                                 && let Some(f) = this.focused_pane.as_ref().and_then(|p| this.pane_focus(p))
                                 && !f.is_focused(window)
                             {

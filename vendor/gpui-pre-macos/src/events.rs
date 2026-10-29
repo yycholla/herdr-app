@@ -6,8 +6,9 @@ use gpui::{
 };
 
 use crate::{
-    LMGetKbdType, NSStringExt, TISCopyCurrentKeyboardLayoutInputSource, TISGetInputSourceProperty,
-    UCKeyTranslate, kTISPropertyUnicodeKeyLayoutData,
+    LMGetKbdType, NSStringExt, TISCopyCurrentKeyboardInputSource,
+    TISCopyCurrentKeyboardLayoutInputSource, TISGetInputSourceProperty, UCKeyTranslate,
+    kTISPropertyInputSourceID, kTISPropertyUnicodeKeyLayoutData,
 };
 use cocoa::{
     appkit::{NSEvent, NSEventModifierFlags, NSEventPhase, NSEventType},
@@ -16,7 +17,37 @@ use cocoa::{
 use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
 use core_graphics::event::CGKeyCode;
 use objc::{msg_send, sel, sel_impl};
-use std::{borrow::Cow, ffi::c_void};
+use std::{borrow::Cow, cell::Cell, ffi::c_void};
+
+thread_local! {
+    // Other GPUI consumers retain native Option behavior unless they opt in.
+    static OPTION_AS_ALT: Cell<Option<bool>> = const { Cell::new(Some(false)) };
+}
+
+/// `None` follows the keyboard layout; `Some` forces Alt or native Option.
+pub fn set_option_as_alt(value: Option<bool>) {
+    OPTION_AS_ALT.set(value);
+}
+
+fn layout_uses_option_as_alt(id: &str) -> bool {
+    matches!(id, "com.apple.keylayout.US" | "com.apple.keylayout.USInternational" | "com.apple.keylayout.ABC")
+        || id.starts_with("com.apple.keylayout.ABC-")
+}
+
+/// Resolved against the current layout so input-source switches take effect immediately.
+pub fn option_as_alt() -> bool {
+    OPTION_AS_ALT.get().unwrap_or_else(|| unsafe {
+        // The active source, not an IME's underlying ASCII keyboard layout.
+        let source = TISCopyCurrentKeyboardInputSource();
+        if source.is_null() {
+            return false;
+        }
+        let id = TISGetInputSourceProperty(source, kTISPropertyInputSourceID as *const c_void);
+        let enabled = !id.is_null() && layout_uses_option_as_alt(id.to_str());
+        let _: () = msg_send![source, release];
+        enabled
+    })
+}
 
 const BACKSPACE_KEY: u16 = 0x7f;
 const SPACE_KEY: u16 = b' ' as u16;
@@ -457,7 +488,7 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
 
                 if !control && !command && !function {
                     let caps_lock = modifiers.contains(NSEventModifierFlags::NSAlphaShiftKeyMask);
-                    let mods = text_modifiers(shift, alt, caps_lock);
+                    let mods = text_modifiers(shift, alt && !option_as_alt(), caps_lock);
 
                     // Keep dead keys for NSTextInputClient instead of sending their
                     // spacing accent to key-down listeners before composition starts.
@@ -595,6 +626,26 @@ fn translate_key(code: CGKeyCode, modifiers: u32, resolve_dead_keys: bool) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_option_as_alt_follows_us_layouts() {
+        for id in ["US", "USInternational", "ABC", "ABC-India"] {
+            assert!(layout_uses_option_as_alt(&format!("com.apple.keylayout.{id}")));
+        }
+        for id in ["Turkish-Q-PC", "German", "ABCother", ""] {
+            assert!(!layout_uses_option_as_alt(&format!("com.apple.keylayout.{id}")));
+        }
+        assert!(!layout_uses_option_as_alt("com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"));
+    }
+
+    #[test]
+    fn explicit_option_as_alt_overrides_layout_detection() {
+        for value in [false, true] {
+            set_option_as_alt(Some(value));
+            assert_eq!(option_as_alt(), value);
+        }
+        set_option_as_alt(Some(false));
+    }
 
     #[test]
     fn caps_lock_goes_into_the_typed_text() {

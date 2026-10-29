@@ -29,7 +29,11 @@ export default class Changes extends View {
   init(_props, cx) {
     this.files = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.handle = cx.focus_handle();
     this.input = InputState.new({ placeholder: "Commit message" });
-    this.input.on("change", (_e, cx) => { this.message = this.input.value(); cx.notify(); });
+    this.input.on("change", (_e, cx) => {
+      const hadMessage = Boolean(this.message.trim());
+      this.message = this.input.value();
+      if (hadMessage !== Boolean(this.message.trim())) cx.notify();
+    });
     this.input.on("submit", (_e, cx) => this.commit(cx));
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });

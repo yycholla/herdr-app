@@ -2694,6 +2694,14 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 
             drop(lock);
 
+            // Alt shortcuts must never enter AppKit's Option/dead-key composition.
+            if key_down_event.keystroke.modifiers.alt
+                && !key_down_event.keystroke.modifiers.platform
+                && crate::events::option_as_alt()
+            {
+                return run_callback(PlatformInput::KeyDown(key_down_event));
+            }
+
             let is_composing =
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())
                     .flatten()

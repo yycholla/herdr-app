@@ -129,6 +129,10 @@ pub fn cache(text: &str) {
     }
 }
 
+pub fn has(version: &str) -> bool {
+    all().iter().any(|note| note.version == version)
+}
+
 fn all() -> Vec<Note> {
     let mut notes = parse(include_str!("../CHANGELOG.md"));
     let fetched = FETCHED.lock().unwrap().clone().unwrap_or_else(|| {
@@ -241,6 +245,15 @@ mod tests {
     }
     fn from(version: Option<&str>, running: &str, fresh: bool) -> Launch {
         Launch::new(Record { last_run: version.map(str::to_owned), ..Record::default() }, running, fresh)
+    }
+    #[test]
+    fn cached_notes_are_version_specific() {
+        let previous = FETCHED.lock().unwrap().replace(Vec::new());
+        assert!(!has("99.0.0"));
+        *FETCHED.lock().unwrap() = Some(parse("## [99.0.0] - 2026-10-30\n- Test release\n"));
+        assert!(has("99.0.0"));
+        assert!(!has("99.0.1"));
+        *FETCHED.lock().unwrap() = previous;
     }
     #[test]
     fn first_install_only_welcomes() {

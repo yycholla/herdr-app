@@ -105,13 +105,25 @@ pub fn installed(commands: &[String], on: Option<&str>) -> Vec<String> {
         }
         None => {
             let shell = crate::window::shell();
-            let words = commands.iter().map(|c| format!("'{}'", c.replace('\'', ""))).collect::<Vec<_>>().join(" ");
-            let line = format!("sh -c '{}' sh {words}", check.replace('\'', ""));
+            let line = installed_line(commands, base(&shell) == "fish");
             crate::mods::run_here(&shell, &["-ic".into(), line]).unwrap_or_default()
         }
     };
     let found: std::collections::HashSet<&str> = out.split("herdr-has:").skip(1).filter_map(|s| s.split_whitespace().next()).collect();
     commands.iter().filter(|c| found.contains(c.as_str())).cloned().collect()
+}
+
+/// Check in the shell itself for functions, but not aliases (`"$@"` cannot run them).
+fn installed_line(commands: &[String], fish: bool) -> String {
+    commands
+        .iter()
+        .map(|c| {
+            let word = format!("'{}'", c.replace('\'', "'\\''"));
+            let unalias = if fish { String::new() } else { format!("unalias -- {word} 2>/dev/null; ") };
+            format!("{unalias}command -v {word} >/dev/null 2>&1 && printf 'herdr-has:%s\\n' {word};")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 thread_local! {
@@ -356,6 +368,18 @@ mod tests {
         let line = powershell_line(&["codex".into(), "fix it".into()]);
         assert_eq!(key(None, &["pwsh.exe", "-NoExit", "-Command", &line]), "codex");
         assert_eq!(key(None, &[r"C:\Windows\powershell.exe"]), "shell");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_checks_functions_and_quoted_names_but_not_aliases() {
+        let commands = ["issue57_function", "issue57_alias", "printf", "missing'command; false"].map(String::from);
+        let line = installed_line(&commands, false);
+        let out = std::process::Command::new("sh")
+            .args(["-c", &format!("issue57_function() {{ :; }}; alias issue57_alias='printf alias'; {line}")])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "herdr-has:issue57_function\nherdr-has:printf\n");
     }
 
     #[test]

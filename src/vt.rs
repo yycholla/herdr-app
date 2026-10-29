@@ -32,10 +32,6 @@ fn contrast(a: Rgb, b: Rgb) -> f32 {
     (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
-/// Below this the text is all but gone; above it the program's colors stay
-/// exactly as it chose (dim text is often meant to be low contrast).
-const MIN_CONTRAST: f32 = 1.6;
-
 /// Ghostty's graphics ranges retain intentional low contrast, as do our sprites.
 fn preserves_graphics_color(text: &str) -> bool {
     crate::sprites::is_sprite(text)
@@ -44,8 +40,8 @@ fn preserves_graphics_color(text: &str) -> bool {
 }
 
 /// `fg`, or near-white / near-black when it would vanish into `bg`.
-fn readable(fg: Rgb, bg: Rgb) -> Rgb {
-    if contrast(fg, bg) >= MIN_CONTRAST {
+fn readable(fg: Rgb, bg: Rgb, minimum: f32) -> Rgb {
+    if minimum <= 1.0 || contrast(fg, bg) >= minimum {
         return fg;
     }
     let (light, dark) = (Rgb(0xf2, 0xf2, 0xf4), Rgb(0x1b, 0x1b, 0x1e));
@@ -59,6 +55,7 @@ pub struct Theme {
     pub cursor: Rgb,
     pub selection_bg: Rgb,
     pub palette16: [Rgb; 16],
+    pub minimum_contrast: f32,
 }
 
 /// The terminal colors from settings.json's theme.
@@ -70,7 +67,7 @@ pub fn theme() -> Theme {
     for (i, c) in palette16.iter_mut().enumerate() {
         *c = get(&format!("ansi{i}"));
     }
-    Theme { fg: get("terminal_foreground"), bg: get("background"), cursor: get("cursor"), selection_bg: get("selection"), palette16 }
+    Theme { fg: get("terminal_foreground"), bg: get("background"), cursor: get("cursor"), selection_bg: get("selection"), palette16, minimum_contrast: crate::settings::get().minimum_contrast }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1145,9 +1142,9 @@ impl Vt {
                 }
             }
 
-            // Text stays readable across themes; graphics keep their chosen colors.
-            if !preserves_graphics_color(&text) {
-                fg = readable(fg, bg.unwrap_or(self.theme.bg));
+            // Contrast adjustment is opt-in; graphics always keep their colors.
+            if self.theme.minimum_contrast > 1.0 && !preserves_graphics_color(&text) {
+                fg = readable(fg, bg.unwrap_or(self.theme.bg), self.theme.minimum_contrast);
             }
 
             Cell {
@@ -1171,6 +1168,11 @@ impl Vt {
     pub fn encode_key(&mut self, key: GhosttyKey, mods: GhosttyMods, consumed: GhosttyMods, text: Option<&str>, unshifted: Option<char>) -> Vec<u8> {
         unsafe {
             ghostty_key_encoder_setopt_from_terminal(self.keys, self.term);
+            #[cfg(target_os = "macos")]
+            {
+                let option = if gpui_macos::option_as_alt() { GHOSTTY_OPTION_AS_ALT_TRUE } else { GHOSTTY_OPTION_AS_ALT_FALSE };
+                ghostty_key_encoder_setopt(self.keys, GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT, &option as *const _ as *const c_void);
+            }
             let e = self.key_event;
             ghostty_key_event_set_action(e, GHOSTTY_KEY_ACTION_PRESS);
             ghostty_key_event_set_key(e, key);
@@ -1357,16 +1359,41 @@ mod tests {
     #[test]
     fn text_that_would_vanish_turns_readable() {
         let (ink, white, dark_red) = (Rgb(0x25, 0x27, 0x2c), Rgb(0xff, 0xff, 0xff), Rgb(0x46, 0x1e, 0x20));
-        assert_eq!(readable(ink, white), ink);
-        assert_ne!(readable(ink, dark_red), ink);
-        assert_eq!(readable(Rgb(0xfa, 0xfa, 0xfa), white), Rgb(0x1b, 0x1b, 0x1e));
+        assert_eq!(readable(ink, white, 1.6), ink);
+        assert_ne!(readable(ink, dark_red, 1.6), ink);
+        assert_eq!(readable(Rgb(0xfa, 0xfa, 0xfa), white, 1.6), Rgb(0x1b, 0x1b, 0x1e));
         // Dim text keeps its color.
-        assert_eq!(readable(Rgb(0x7b, 0x7e, 0x87), white), Rgb(0x7b, 0x7e, 0x87));
+        assert_eq!(readable(Rgb(0x7b, 0x7e, 0x87), white, 1.6), Rgb(0x7b, 0x7e, 0x87));
+    }
+
+    #[test]
+    fn program_colors_are_unchanged_by_default_and_contrast_reloads_live() {
+        let mut vt = Vt::new(8, 4);
+        let original = theme();
+        assert_eq!(original.minimum_contrast, 1.0);
+        vt.write(b"\x1b[38;2;215;153;33;48;2;104;157;106m XX  \x1b[0m\r\n\x1b[38;5;178;48;5;72m XX  \x1b[0m\r\n\x1b[33;46m XX  \x1b[0m");
+        let expected = [Rgb(215, 153, 33), Rgb(215, 175, 0), original.palette16[3]];
+        let before = vt.frame();
+        for (row, fg) in before.rows.iter().zip(expected) {
+            assert_eq!(row[1].fg, fg);
+        }
+        vt.set_theme(Theme { minimum_contrast: 1.6, ..original.clone() });
+        let adjusted = vt.frame();
+        for (i, fg) in expected.iter().enumerate() {
+            assert_ne!(adjusted.rows[i][1].fg, *fg);
+            assert!(!Rc::ptr_eq(&before.rows[i], &adjusted.rows[i]));
+        }
+        vt.set_theme(original);
+        let restored = vt.frame();
+        for (i, fg) in expected.iter().enumerate() {
+            assert_eq!(restored.rows[i][1].fg, *fg);
+        }
     }
 
     #[test]
     fn graphics_keep_low_contrast_colors_in_frames() {
         let mut vt = Vt::new(8, 2);
+        vt.set_theme(Theme { minimum_contrast: 1.6, ..theme() });
         let fg = Rgb(30, 31, 40);
         for code in (0x2500..=0x259f).chain(0xe0b0..=0xe0d7).chain(0x1fb00..=0x1fbff).chain(0x1cc00..=0x1cebf).chain([0x23fa]) {
             let ch = char::from_u32(code).unwrap();

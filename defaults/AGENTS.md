@@ -303,7 +303,9 @@ layout's look and a block can differ:
 - `themes/<name>.json`: `{ "background", "foreground", "selection",
   "cursor"?, "ansi": [16 colors], "colors"?: {...} }`, all `#rrggbb`; panel
   colors are derived from these, `colors` overrides them. Herdr ships
-  `atom-one-dark`. A theme named like a layout (`themes/win98.json`) is
+  `atom-one-dark`. The original unedited Atom One Dark and Win98 theme files
+  are upgraded to readable terminal colors; edited theme files are kept.
+  A theme named like a layout (`themes/win98.json`) is
   that layout's own: Settings offers it only there.
 - `font` / `font_size`: the terminals' (px at zoom 1); `ui_font`: the mods'
   (their text sizes are their own, in px, and follow zoom). Optional: without
@@ -597,7 +599,9 @@ What's about the user, never a look:
 - `appearance`: `"light"` or `"dark"` always; absent, the system's. A layout
   with a light and a dark theme shows the matching one.
 - Updates: an installed app downloads them by itself and offers Restart and
-  What changed. The first start after an app update also updates herdr-core
+  What changed. If the app crashes or is killed with a verified newer update
+  waiting, the next launch installs it before opening a window. The first
+  start after an app update also updates herdr-core
   to the latest release of the same generation, keeping terminals running.
   Settings → Updates keeps app and core actions together;
   its What's new button opens the waiting update's release range, or this
@@ -628,6 +632,19 @@ What's about the user, never a look:
   apps' links alone. Disk-image and translocated launches don't create it.
   Finder launches load the login shell's PATH, with the usual install
   folders as a fallback.
+- `option_as_alt`: macOS only, `"auto"` (default), `"on"`, or `"off"`.
+  `"auto"` sends Option as Alt on US, US International, ABC and ABC variants;
+  other layouts keep native Option text and dead keys. `"on"` enables terminal
+  Alt shortcuts (including Option+E without composition); `"off"` keeps native
+  Option input on every layout. Changes apply immediately, including layout
+  switches. Linux and Windows are unchanged.
+- `minimum_contrast`: terminal text contrast ratio, `1` (default) leaves
+  program colors unchanged. Set it to `1.6` to enable the previous readability
+  adjustment, or another number from `1` to `21`. Text below that ratio is
+  replaced with near-white or near-black, whichever contrasts more with its
+  background; this is a threshold, not a guaranteed resulting ratio.
+  Box/block, Powerline and sprite glyph colors are never adjusted.
+  Changes apply immediately, including text already on screen.
 - `clipboard_write`: `false` blocks terminal programs from writing the local
   clipboard (default `true`, including remote terminals attached in this window).
   OSC 52 accepts base64 UTF-8 text up to 1 MiB: `c` writes the system clipboard,
@@ -666,7 +683,14 @@ has 120 programs (agents, editors, runtimes, tools, databases, infra);
 - `match`: other process names (or agents' `app` names) for the entry.
 - `run`: how to start it (`["cursor-agent"]`), for agents people start
   from a menu: `knownAgents()` lists the entries with one, and whether this
-  machine (or another) has them installed.
+  machine (or another) has them installed. For example, override
+  `"claude": { "run": ["my-claude"] }` or add
+  `"claude-alt": { "name": "Claude (alt)", "icon": "icons/claude.svg", "run": ["my-claude-alt"] }`
+  inside `programs`. Use programs or shell functions, not aliases (the launcher
+  does not expand them). Local checks include functions in shells such as bash
+  and zsh; fish and remote checks find executables only. Installation
+  checks are cached for up to a minute; changing the commands checks again.
+  Invalid JSON is reported in `programs.error` (a valid file has no error).
 - It follows what runs in the terminal now (lazygit, nvim), else what it
   started with.
 

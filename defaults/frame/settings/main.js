@@ -433,6 +433,8 @@ export default class Settings extends View {
       .border_1()
       .border_color(t.border)
       .bg(t.background)
+      // Let the child's native scroll run before stopping the page's wheel event.
+      .on_scroll_wheel((_e, cx) => cx.stop_propagation())
       .child(
         div()
           .px(12)

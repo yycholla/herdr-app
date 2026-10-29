@@ -307,6 +307,24 @@ fn tabs_leave_room_for_macos_traffic_lights(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn font_pickers_contain_scroll_on_the_wrapper(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for which in ["font", "ui_font"] {
+        let mut p = props();
+        p["section"] = json!("look");
+        let tree = describe(
+            cx, &staged, "frame/settings", true, p, updates("current", "current"),
+            Some(&format!("this.picking = '{which}';")),
+        ).unwrap();
+        let scroll = tree.lines().find(|line| line.contains(&format!("st-fl-{which}"))).unwrap();
+        assert!(scroll.contains("overflow_y_scrollbar"), "{tree}");
+        assert!(!scroll.contains("on_scroll_wheel"), "the native scroller must receive the event: {tree}");
+        assert_eq!(tree.matches("on_scroll_wheel").count(), 1, "the wrapper must stop scroll chaining: {tree}");
+    }
+}
+
+#[gpui::test]
 fn settings_sections_and_updates(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let start = Instant::now();
