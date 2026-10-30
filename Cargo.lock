@@ -2039,6 +2039,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "easel-compiler"
 version = "0.1.0"
+source = "git+https://github.com/yycholla/easel?rev=dac81ee606e87c10c73c0100911fbe4fb0096f11#dac81ee606e87c10c73c0100911fbe4fb0096f11"
 dependencies = [
  "anyhow",
  "easel-interp",
@@ -2050,6 +2051,7 @@ dependencies = [
 [[package]]
 name = "easel-interp"
 version = "0.1.0"
+source = "git+https://github.com/yycholla/easel?rev=dac81ee606e87c10c73c0100911fbe4fb0096f11#dac81ee606e87c10c73c0100911fbe4fb0096f11"
 dependencies = [
  "gpui-pre",
  "proc-macro2",
@@ -2062,6 +2064,7 @@ dependencies = [
 [[package]]
 name = "easel-protocol"
 version = "0.1.0"
+source = "git+https://github.com/yycholla/easel?rev=dac81ee606e87c10c73c0100911fbe4fb0096f11#dac81ee606e87c10c73c0100911fbe4fb0096f11"
 dependencies = [
  "easel-interp",
  "serde",
@@ -2071,6 +2074,7 @@ dependencies = [
 [[package]]
 name = "easel-ui"
 version = "0.1.0"
+source = "git+https://github.com/yycholla/easel?rev=dac81ee606e87c10c73c0100911fbe4fb0096f11#dac81ee606e87c10c73c0100911fbe4fb0096f11"
 dependencies = [
  "anyhow",
  "easel-compiler",

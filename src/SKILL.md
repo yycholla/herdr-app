@@ -67,6 +67,25 @@ worker. Use app commands when the
 user wants to see a new tab or split, hc for orchestration that need not change
 the screen.
 
+## GPUI artifacts in Easel
+
+`herdr-app do easel.open --terminal <address> --project /absolute/project`
+opens that project's native artifact canvas beside its terminal. It focuses
+an existing Easel pane for the project instead of creating a duplicate.
+Use `--direction down` or `--tab true` for another placement. Local panes only.
+
+The companion `gpui-artifacts-mcp` uses `HC_TERMINAL_ID` (or a visible
+`REX_BLOCK`) to request this pane automatically. It always passes its own
+project, selected by `GPUI_ARTIFACTS_PROJECT` or its startup directory.
+For a worktree while the shell stays on main, start the MCP server with
+`GPUI_ARTIFACTS_PROJECT=/absolute/worktree`; it does not track later shell
+directory changes.
+An already-open project socket is reused. Outside Herdr it starts the
+standalone viewer; `GPUI_ARTIFACTS_VIEWER` explicitly selects that workflow.
+If Herdr recognizes the terminal but cannot open Easel, the tool reports the
+error rather than opening another window. `GPUI_ARTIFACTS_HERDR` can select
+a different Herdr executable. Restart the agent's MCP connection after updating it.
+
 ## Customize layouts, keys, or mods
 
 First read `~/.config/herdr-app/AGENTS.md` (or `$HERDR_APP_HOME/AGENTS.md` if

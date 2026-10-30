@@ -518,7 +518,15 @@ The main ones:
   the pane, default the focused one, "right" or "down", or as a new tab with `tab: true`;
   project default: the project of the pane's terminal's folder; a project with an
   Easel pane already gets it focused; returns `{pane}`). Claude's GPUI artifacts
-  server runs it itself from a Herdr terminal: `herdr-app do easel.open --terminal $HC_TERMINAL_ID`.
+  companion server opens it from a visible Herdr terminal using `HC_TERMINAL_ID`
+  (or `REX_BLOCK`) and passes its own project explicitly:
+  `herdr-app do easel.open --terminal <address> --project /absolute/project`.
+  The MCP project comes from `GPUI_ARTIFACTS_PROJECT` or its startup directory;
+  set that variable to the worktree when the terminal stays on main.
+  Requires the updated `gpui-artifacts-mcp` companion; an existing project
+  socket is reused. Outside Herdr, or with `GPUI_ARTIFACTS_VIEWER` set, it
+  uses the standalone viewer. `GPUI_ARTIFACTS_HERDR` selects the Herdr binary.
+  Remote panes are not supported yet.
   `pane.focus {terminal}` prefers the first visible layout terminal block showing that
   address, then its model pane. Clicking a terminal block focuses it too.
   While a layout terminal block is focused, implicit split/close/zoom/go/swap and
