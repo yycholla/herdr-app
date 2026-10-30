@@ -41,6 +41,8 @@ pub const COMMANDS: &[Command] = &[
     cmd("tab.move", &[req("id"), req("index")], "Move a tab to a position in its space (1 = first)."),
     cmd("pane.split", &[req("direction"), opt("pane"), opt("argv"), opt("mod"), opt("props")], "Split a pane (default: the focused one) \"right\" or \"down\" with a new terminal, or with a mod (`mod`, its `props`) beside it."),
     cmd("pane.close", &[opt("pane")], "Close a pane and end its terminal."),
+    cmd("easel.open", &[opt("project"), opt("pane"), opt("terminal"), opt("direction"), opt("tab")],
+        "Open a project's Easel (the GPUI artifacts Claude renders there, with their chat) as a pane: beside a pane (default: the focused one; a terminal: its pane) \"right\" (default) or \"down\", or as a new tab with tab. project: an absolute folder (default: the project of the pane's terminal's folder, else of the space's folder). A project with an Easel pane already gets that one focused. Returns its pane."),
     cmd("terminal.open", &[opt("argv"), opt("folder"), opt("place"), opt("name")], "Start a terminal: as a new tab (place \"tab\", default), or \"right\"/\"down\" of the focused pane."),
     cmd("terminal.keep", &[req("terminal"), opt("place")], "Give a running terminal without a pane (a sub-agent) a pane: a new tab, or \"right\"/\"down\"."),
     cmd("terminal.park", &[req("terminal")], "Take a terminal's pane away and disable core keep; it keeps running (a sub-agent shows under its parent again)."),

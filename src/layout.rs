@@ -28,6 +28,8 @@ pub enum Content {
     },
     /// An agent's terminal, full size (`"focused"`: the selected agent).
     Agent { agent: String },
+    /// A project's Easel: the GPUI artifacts Claude renders there (easel.rs).
+    Easel { easel: String },
 }
 
 /// Which side of its node a floating block sits on. Left/right make it
@@ -465,9 +467,9 @@ impl Node {
         }
     }
 
-    /// A pane in a tab: a terminal, or a mod beside them (a viewer, a board).
+    /// A pane in a tab: a terminal, or a mod or an Easel beside them (a viewer, a board).
     pub fn is_pane(&self) -> bool {
-        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. }))
+        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. } | Content::Easel { .. }))
     }
 
     pub fn closable(&self) -> bool {
@@ -747,6 +749,21 @@ mod tests {
         assert_eq!((n.floating[0].edge, n.floating[0].align), (Edge::Left, Align::Center));
         let back: Node = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
         assert_eq!(back, n);
+    }
+
+    #[test]
+    fn easel_panes_round_trip() {
+        let json = r#"{ "id": "c1", "type": "row", "children": [
+            { "id": "p1", "type": "block", "content": { "terminal": "t1" } },
+            { "id": "p2", "type": "block", "content": { "easel": "/src/app" }, "size": { "weight": 1 } } ] }"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        let e = n.find("p2").unwrap();
+        assert_eq!(e.content(), Some(&Content::Easel { easel: "/src/app".into() }));
+        assert!(e.is_pane() && e.terminal().is_none());
+        assert_eq!(n.panes().len(), 2);
+        let text = serde_json::to_string(&n).unwrap();
+        assert!(text.contains(r#""content":{"easel":"/src/app"}"#), "{text}");
+        assert_eq!(serde_json::from_str::<Node>(&text).unwrap(), n);
     }
 
     fn term(id: &str) -> Node {

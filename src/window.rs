@@ -372,6 +372,8 @@ pub struct AppWindow {
     terms: HashMap<String, Term>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
+    /// Easel views by pane id.
+    easels: crate::easel::Panes,
     overlays: Vec<Overlay>,
     folders: BTreeMap<String, Found>,
     /// Mods placed once; later the layout decides where (or whether) they show.
@@ -466,6 +468,7 @@ impl AppWindow {
             model: Model::default(),
             terms: HashMap::new(),
             copies: HashMap::new(),
+            easels: Default::default(),
             overlays: Vec::new(),
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
@@ -852,6 +855,7 @@ impl AppWindow {
         }
         if settings::set(s) {
             mods::apply_theme(cx);
+            self.easels.restyle(cx);
             self.refresh_mods(cx);
             window.refresh();
         }
@@ -1442,6 +1446,7 @@ impl AppWindow {
             }
         }
         self.publish_shown_copies();
+        self.sync_easels(window, cx);
 
         // Keyboard to the focused pane when it changes (never steal it from an open dialog).
         let model_pane = self.model.focused_pane();
@@ -1516,7 +1521,35 @@ impl AppWindow {
     }
 
     fn pane_focus(&self, pane: &str) -> Option<FocusHandle> {
-        self.pane_term(pane).map(|t| t.focus.clone())
+        self.pane_term(pane).map(|t| t.focus.clone()).or_else(|| self.easels.focus(pane))
+    }
+
+    /// An Easel view per Easel pane any layout has, started when it's shown;
+    /// one that couldn't start tries again a little later.
+    fn sync_easels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owned: HashMap<String, String> =
+            crate::easel::panes(self.chrome.walk()).chain(self.model.tabs().flat_map(|c| crate::easel::panes(c.root.walk()))).collect();
+        let mut shown: Vec<(String, String)> = crate::easel::panes(self.chrome.visible_blocks()).collect();
+        if self.shows_tab()
+            && let Some(c) = self.model.active_tab()
+        {
+            shown.extend(crate::easel::panes(c.shown().visible_blocks()));
+        }
+        if self.easels.sync(&owned, &shown, window, cx) && self.easels.retry.is_none() {
+            self.easels.retry = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(crate::easel::RETRY).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.easels.retry = None;
+                    this.sync_easels(window, cx);
+                    cx.notify();
+                });
+            }));
+        }
+    }
+
+    /// Quitting: the Easels save and let go of their projects now.
+    pub(crate) fn close_easels(&mut self, cx: &mut Context<Self>) {
+        self.easels.close_all(cx);
     }
 
     fn load(&self, inst: Instance, window: &mut Window, cx: &mut Context<Self>) -> Copy {
@@ -1584,6 +1617,12 @@ impl AppWindow {
                     // A mod pane: what it shows, no terminal.
                     if let Some(Content::Mod { name, .. }) = p.content() {
                         panes.push(json!({ "pane": p.id, "terminal": null, "mod": name, "tab": ctx.id, "title": name, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
+                        continue;
+                    }
+                    // An Easel pane: its project, no terminal.
+                    if let Some(Content::Easel { easel }) = p.content() {
+                        let title = format!("Easel · {}", model::folder_name(easel, &home));
+                        panes.push(json!({ "pane": p.id, "terminal": null, "easel": easel, "tab": ctx.id, "title": title, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
                         continue;
                     }
                     let Some(addr) = p.terminal() else { continue };
@@ -2352,6 +2391,34 @@ impl AppWindow {
         Ok(json!({ "pane": new }))
     }
 
+    /// An Easel pane for a project: the one it has, else a new one beside the
+    /// target or as a tab.
+    fn open_easel(&mut self, o: crate::easel::Opening) -> Result<Value, String> {
+        use crate::easel::How;
+        let content = || Content::Easel { easel: o.project.to_string_lossy().into_owned() };
+        let pane = match o.how {
+            How::Focus(pane) => {
+                self.model.focus_pane(&pane);
+                self.focused_pane = None;
+                pane
+            }
+            How::Split { target, axis } => {
+                self.require_document(None)?;
+                let new = self.model.fresh_id("p");
+                self.model.split_with(&target, axis, Node::block(new.clone(), content()));
+                new
+            }
+            How::Tab { space } => {
+                self.require_document(None)?;
+                let (tab, pane) = (self.model.fresh_id("tb"), self.model.fresh_id("p"));
+                self.model.add_tab(&space, Tab::with_pane(&tab, "", Node::block(pane.clone(), content())));
+                self.model.active = Some(space);
+                pane
+            }
+        };
+        Ok(json!({ "pane": pane }))
+    }
+
     /// Ask only whether a missing terminal is closed. Core owns restarting it.
     fn check_closed(&mut self, missing: Vec<(String, String)>, window: &mut Window, cx: &mut Context<Self>) {
         self.checking_closed = true;
@@ -2782,6 +2849,12 @@ impl AppWindow {
                     Some(name) => self.split_mod(Self::owned(a, "pane"), axis, name, a.get("props").cloned().unwrap_or(Value::Null)),
                     None => self.split(Self::owned(a, "pane"), axis, Self::argv(a)),
                 };
+                self.answer(r);
+            }
+            "easel.open" => {
+                let cwds = &self.cwds;
+                let r = crate::easel::plan(&self.model, a, &|address| cwds.get(address).cloned(), &easel_protocol::project_root)
+                    .and_then(|o| self.open_easel(o));
                 self.answer(r);
             }
             "pane.close" => {
@@ -3809,6 +3882,30 @@ impl AppWindow {
                 None => div().into_any_element(),
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
+            Content::Easel { .. } => {
+                // Like a mod pane: a click makes it the focused pane, and the keyboard
+                // goes to the Easel unless one of its own fields just took it.
+                let id = n.id.clone();
+                div()
+                    .size_full()
+                    .on_any_mouse_down(cx.listener(move |this, _, window, cx| {
+                        if this.focused_pane.as_deref() != Some(id.as_str()) && this.model.tab_of(&id).is_some() {
+                            this.model.focus_pane(&id);
+                            this.focused_pane = Some(id.clone());
+                            this.synced_model_pane = this.model.focused_pane();
+                            this.publish(cx);
+                            this.save();
+                            cx.notify();
+                        }
+                        if let Some(f) = this.easels.focus(&id)
+                            && !f.contains_focused(window, cx)
+                        {
+                            f.focus(window, cx);
+                        }
+                    }))
+                    .child(self.easels.render(&n.id))
+                    .into_any_element()
+            }
             Content::Agent { .. } => match self.shown_agent() {
                 Some(addr) => match self.agent_view(&n.id, &addr) {
                     Some(t) => div().size_full().child(shown_terminal(&t.view, cx)).into_any_element(),

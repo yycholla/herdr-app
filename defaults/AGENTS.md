@@ -123,6 +123,10 @@ machine first, then machines by name; `space.move` stays inside its machine's bl
   the keyboard when clicked, and is saved with its tab; its `props` tell
   it what to show (a file, a folder). Closing a terminal pane ends its
   terminal, and a program exiting closes its pane, even if Herdr was closed.
+  An **Easel** pane (`easel.open`) shows a project's GPUI artifacts: what
+  Claude renders there with its `render_gpui` tool, the annotations on them
+  and the chat with it. One per project; it splits, zooms, closes and is
+  saved like a mod pane.
   Terminal panes are kept by their machine's core (`keep: true`). A lost
   terminal (core crash, reboot, logout) gets a shell in its last folder,
   with the same address; its original command is never run again. Splits
@@ -212,7 +216,9 @@ A layout is a tree of nodes. Four types:
   `{ "terminal": "t7" }`, `{ "tab": "active" }` (the shown tab's
   terminals as it arranges them), or `{ "agent": "focused" }` (one agent's
   terminal, full size: the one chosen with `agent.focus` / `agent.next`, else
-  the focused pane's agent, else the first agent).
+  the focused pane's agent, else the first agent), or `{ "easel": "/abs/project" }`
+  (that project's Easel; it can't open while another window, such as the
+  standalone viewer, has the project: it says so and tries again).
 - `row` / `column`: children side by side / stacked.
 - `stack`: shows one child (`"active": "<child id>"`), with an optional
   `"header"` (a mod that draws tabs, or `"tabs"` for a plain built-in strip).
@@ -507,7 +513,12 @@ The main ones:
   skip settled tabs).
 - Panes: `pane.split {direction: "right" | "down", pane?, argv? | mod?, props?}` (a new
   terminal, or a mod pane), `pane.close {pane?}`,
-  `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`.
+  `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`,
+  `easel.open {project?, pane? | terminal?, direction?, tab?}` (a project's Easel beside
+  the pane, default the focused one, "right" or "down", or as a new tab with `tab: true`;
+  project default: the project of the pane's terminal's folder; a project with an
+  Easel pane already gets it focused; returns `{pane}`). Claude's GPUI artifacts
+  server runs it itself from a Herdr terminal: `herdr-app do easel.open --terminal $HC_TERMINAL_ID`.
   `pane.focus {terminal}` prefers the first visible layout terminal block showing that
   address, then its model pane. Clicking a terminal block focuses it too.
   While a layout terminal block is focused, implicit split/close/zoom/go/swap and

@@ -2037,6 +2037,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "easel-compiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "easel-interp",
+ "easel-protocol",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "easel-interp"
+version = "0.1.0"
+dependencies = [
+ "gpui-pre",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.119",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "easel-protocol"
+version = "0.1.0"
+dependencies = [
+ "easel-interp",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "easel-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "easel-compiler",
+ "easel-interp",
+ "easel-protocol",
+ "futures",
+ "gpui-pre",
+ "image",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3698,6 +3745,8 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64",
+ "easel-protocol",
+ "easel-ui",
  "fancy-regex 0.19.2",
  "ghostty-sys",
  "gpui-base",

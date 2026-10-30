@@ -5,6 +5,7 @@ mod bench;
 mod commands;
 mod control;
 mod core_bin;
+mod easel;
 mod files;
 mod hc;
 mod keys;
@@ -164,6 +165,7 @@ fn main() {
             settings::note_fonts(cx.text_system().all_font_names());
             settings::load_home_fonts(cx);
             mods::init(cx);
+            easel::init(cx);
             // Not restarted for it: the update goes in when the app quits.
             cx.on_app_quit(|cx| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
@@ -173,6 +175,7 @@ fn main() {
                         let _ = w.update(cx, |this, window, cx| {
                             this.drain_documents(window, cx);
                             this.close_mods_now(deadline, window, cx);
+                            this.close_easels(cx);
                             place::save(window, cx);
                         });
                     }

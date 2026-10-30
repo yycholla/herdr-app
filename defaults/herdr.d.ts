@@ -178,11 +178,14 @@ export function agents(): AgentInfo[];
 export interface PaneInfo {
   pane: string;
   /** null for a mod pane (`pane.split {mod}`): then `mod` names it, and only
-   *  pane, mod, tab, title, focused and zoomed are set. */
+   *  pane, mod, tab, title, focused, zoomed and movable are set. Also null
+   *  for an Easel pane (`easel.open`): then `easel` is its project folder. */
   terminal: string | null;
   mod?: string;
+  easel?: string;
   tab: string;
-  /** The terminal's title (what the program set), or the mod's name. */
+  /** The terminal's title (what the program set), the mod's name, or
+   *  `Easel · <project>`. */
   title: string;
   /** Its live folder, and the git branch there. */
   cwd: string | null;

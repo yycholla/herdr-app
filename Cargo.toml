@@ -41,6 +41,9 @@ tungstenite = "0.29"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 url = "2"
+# Easel panes (GPUI artifacts). A path for now; a pinned git dependency once pushed.
+easel-ui = { path = "../easel/crates/easel-ui" }
+easel-protocol = { path = "../easel/crates/easel-protocol" }
 
 [[test]]
 name = "shot_pixels"
