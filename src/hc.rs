@@ -17,6 +17,7 @@ pub const CREDIT: u8 = 1;
 pub const CLOSE: u8 = 2;
 pub const RESIZE: u8 = 3;
 pub const FOCUS: u8 = 4;
+pub const FACTS: u8 = 5;
 
 pub enum Stream {
     Data(Vec<u8>),
@@ -229,6 +230,7 @@ pub trait Link: Send + Sync {
     fn reply(&self, channel: u32, bytes: &[u8]);
     fn credit(&self, channel: u32, n: usize);
     fn resize(&self, channel: u32, cols: u16, rows: u16);
+    fn facts(&self, channel: u32, display: &Value);
     fn focus(&self, channel: u32, focused: bool);
     fn detach(&self, channel: u32);
     /// Closes when the connection drops.
@@ -444,6 +446,7 @@ impl Core {
     pub fn reply(&self, channel: u32, bytes: &[u8]) { if !bytes.is_empty() { self.link.reply(channel, bytes) } }
     pub fn credit(&self, channel: u32, n: usize) { self.link.credit(channel, n) }
     pub fn resize(&self, channel: u32, cols: u16, rows: u16) { self.link.resize(channel, cols, rows) }
+    pub fn facts(&self, channel: u32, display: &Value) { self.link.facts(channel, display) }
     pub fn focus(&self, channel: u32, focused: bool) { self.link.focus(channel, focused) }
     pub fn detach(&self, channel: u32) { self.link.detach(channel) }
     pub fn close(&self) { self.link.close() }
@@ -531,6 +534,12 @@ impl Link for HcLink {
         let mut p = cols.to_le_bytes().to_vec();
         p.extend(rows.to_le_bytes());
         self.send(channel, RESIZE, &p);
+    }
+
+    /// This viewer's display facts changed (colors, cell size): the core
+    /// answers the program's queries with them.
+    fn facts(&self, channel: u32, display: &Value) {
+        self.send(channel, FACTS, display.to_string().as_bytes());
     }
 
     fn focus(&self, channel: u32, focused: bool) {

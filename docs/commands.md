@@ -118,6 +118,18 @@ Close a pane and end its terminal.
 |---|---|
 | `pane` | no |
 
+## `easel.open`
+
+Open a project's Easel (the GPUI artifacts Claude renders there, with their chat) as a pane: beside a pane (default: the focused one; a terminal: its pane) "right" (default) or "down", or as a new tab with tab. project: an absolute folder (default: the project of the pane's terminal's folder, else of the space's folder). A project with an Easel pane already gets that one focused. Returns its pane.
+
+| Argument | Required |
+|---|---|
+| `project` | no |
+| `pane` | no |
+| `terminal` | no |
+| `direction` | no |
+| `tab` | no |
+
 ## `terminal.open`
 
 Start a terminal: as a new tab (place "tab", default), or "right"/"down" of the focused pane.
@@ -279,13 +291,13 @@ No arguments.
 
 ## `terminal.paste`
 
-Paste into the focused terminal (an image alone, into one on another machine, as a file there).
+Paste into the focused terminal (copied files as if dropped; an image alone as terminal.paste_image pastes it).
 
 No arguments.
 
 ## `terminal.paste_image`
 
-Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; otherwise Ctrl+V goes to the terminal.
+Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal.
 
 No arguments.
 
@@ -396,7 +408,7 @@ Reset a shipped layout and its clicks (the old file is kept aside).
 
 ## `mod.open`
 
-Open a mod as the overlay its mod.json describes.
+Toggle a mod as the overlay its mod.json describes; calling again closes it.
 
 | Argument | Required |
 |---|---|
@@ -439,7 +451,7 @@ Draft feedback for the person to review and send (from: person or agent).
 
 ## `app.palette`
 
-Open the command palette: every command by name, with its key.
+Toggle the command palette: every command by name, with its key; calling again closes it.
 
 No arguments.
 
@@ -456,6 +468,14 @@ Open the settings (section: look, alerts, updates).
 Look for a newer Herdr and herdr-core now.
 
 No arguments.
+
+## `app.backend`
+
+Run terminals on "herdr-core" or a "rex" server (settings.json `rex_server`, else the local one). The window switches to its spaces and terminals; the old backend's keep running there.
+
+| Argument | Required |
+|---|---|
+| `backend` | yes |
 
 ## `app.update_core`
 
