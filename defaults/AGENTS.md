@@ -51,8 +51,11 @@ commands. They're rewritten on every start to match this version.
 - Edits apply at once. If a file is invalid, the app keeps the last good
   version and writes why to `<name>.error` (`layout.error`, `keys.error`,
   `settings.error`, `programs.error`). Check after every edit.
-- `herdr-app check <mod folder>` loads a mod once and reports what's wrong.
-  Never call a mod done without a passing check.
+- `herdr-app check <mod folder>` loads a mod once and checks its initial
+  description and eager native elements, including virtual lists and motion.
+  It does not lay out the mod or run deferred rows, nested renders, or later
+  async states. Never call a mod done without a passing check; also try it
+  in the app.
 - **Escape hatch:** `ctrl-alt-shift-escape` always works: it sets the shown
   layout and `keys.json` aside (`*.reset-<time>`) and goes back to the
   default `main` layout. Nothing can rebind it.
@@ -96,6 +99,8 @@ is no `spaces.json`. On simultaneous edits the newest accepted document wins
 (no merging); structural commands fail while that machine's layout is unavailable.
 Mod pane props are stored as given, never machine-qualified. Space order is local
 machine first, then machines by name; `space.move` stays inside its machine's block.
+In the expanded Spaces sidebar, drag a space to reorder it within its machine;
+the highlighted line shows where it will land.
 
 - A **space** is a place to work, on one machine: this one, or another
   from `hc machine ls` (`spaces()[i].machine`). Herdr leaves out machines
@@ -170,7 +175,8 @@ shared `"workspace.panels"`, set by the welcome); a status bar,
 `workspace-status`), and as examples `terminals` ("Terminals": tabs in
 the title bar, panes as cards, a space picker) and `win98`
 ("Herdr 98": a whole desktop in one mod, `win98`). Add a layout by
-writing a new file.
+writing a new file. The Files panel supports Windows folder paths with spaces,
+parentheses and apostrophes.
 
 **Herdr's own layouts and mods are read-only.** They are replaced whole
 on every start. Use settings.json for look (fonts, sizes, theme, colors,
@@ -245,6 +251,8 @@ Properties any node can have:
   buttons over the layout at `"traffic_lights": [x, y]` (px); leave them
   room. Where the system draws no buttons (`window().buttons`, Linux and
   Windows), the bar draws them with `window.minimize`, `window.maximize`, `window.close`.
+  Windows' shipped tab bar and system strip use vector window icons, with a
+  restore icon when maximized, rather than font glyphs.
 - Root only: `"preview": "layouts/<name>.svg"` (or png): the picture the
   settings screen shows for this layout. Draw one when you make a layout;
   without it the person sees a plain frame. New layouts and `themes/*.json`
@@ -399,13 +407,16 @@ Narrower than 160px, the sidebar mods draw a compact rail; folding resizes
 `sidebar` to 44 (76 on macOS, room for the traffic lights). On macOS,
 the tabs also leave room for the window buttons when the sidebar is narrower.
 
-### Layouts other people made
+### Layouts and mods other people made
 
-People share layouts at herdr.dev/layouts. Each is a folder laid out like
-this home: `layouts/<name>.json`, the `mods/<name>/` it needs, a
-`RECIPE.md` (the brief to build it from scratch) and a `preview.png`. The
-files are one build of the recipe. Asked to add one
-(`herdr.dev/layouts/<owner>/<name>`, or a folder on GitHub):
+People share layouts at herdr.dev/layouts and mods at herdr.dev/mods. Each
+is a folder laid out like this home: a layout has `layouts/<name>.json` and
+the `mods/<name>/` it needs; a mod is a piece for the person's own window,
+so it has only `mods/<name>/` and maybe a `keys.json` with the keys it
+expects. Both have a `RECIPE.md` (the brief to build it from scratch) and a
+`preview.png`. The files are one build of the recipe. Asked to add one
+(`herdr.dev/layouts/<owner>/<name>`, `herdr.dev/mods/<owner>/<name>`, or a
+folder on GitHub):
 
 1. Read the recipe and every file before writing anything. Before adding,
    tell the person if a mod reaches the network, runs programs (`exec`,
@@ -418,17 +429,20 @@ files are one build of the recipe. Asked to add one
    program, a name clash) or the person asks. If the files don't work on
    this version, or the person wants it different, build it from the
    recipe instead.
-4. `herdr-app check` each mod, then `layout.switch {name}`. The person's
-   own layout stays as it was; `ctrl-shift-l` switches back, and deleting
-   the files removes it.
+4. A mod's `keys.json`: merge it into the person's. Add its sections and
+   keys, and ask before replacing a key they already use.
+5. `herdr-app check` each mod; for a layout, then `layout.switch {name}`.
+   The person's own layout stays as it was; `ctrl-shift-l` switches back,
+   and deleting the files removes it.
 
-To share one: put that folder in a public GitHub repo (one folder per
-layout if there are several), write its `RECIPE.md`, save a screenshot of
-it as `preview.png` and add the repo topic `herdr-layout`. It shows up at
-herdr.dev/layouts within the hour.
+To share one: put that folder in a public GitHub repo (one folder each if
+there are several), write its `RECIPE.md`, save a screenshot of it as
+`preview.png` and add the repo topic `herdr-layout` for a layout or
+`herdr-mod` for a mod. It shows up at herdr.dev/layouts or herdr.dev/mods
+within the hour.
 
 A `RECIPE.md` is a brief: another agent with an empty folder builds the
-layout from it. Write it from the real files, in this order:
+layout or mod from it. Write it from the real files, in this order:
 
 1. `# Name`, one paragraph of what the person sees, `![Name](preview.png)`.
 2. **What you see:** the regions top to bottom or left to right, their
@@ -475,6 +489,9 @@ the build doesn't do.
 - Windows AltGr and dead-key compositions type text in terminals. macOS
   dead keys compose accents through native text input; Option keeps its
   keyboard-layout characters rather than acting as Alt.
+- On macOS, shifted punctuation shortcuts accept both spellings from the
+  current layout: `cmd-shift-]` and `cmd-}` match the same US-layout keypress.
+  Existing `keys.json` files don't need to change.
 - Terminal keys honor the program's negotiated Kitty mode, including on Windows.
 
 ## Commands
@@ -514,31 +531,43 @@ The main ones:
   `terminal.show` fail, as do `terminal.open`/`terminal.keep` with place right/down.
   They never act on the terminal's source pane. An explicit `pane` still targets that
   model pane; composition edits belong to the mod (edit its layout instead).
-- Terminals: `terminal.open {argv?, folder?, place?, name?}`, `terminal.kill {terminal}`,
+- Terminals: `terminal.open {argv?, folder?, place?, name?}` (`folder` sets the
+  starting directory for tabs and right/down splits, with or without `argv`), `terminal.kill {terminal}`,
   `terminal.keep {terminal, place?}`, `terminal.park {terminal}`,
   `terminal.peek {terminal}` (peek over the tab, with keep-as-tab and close),
-  `terminal.show {terminal?, pane?}`, `terminal.copy`, `terminal.paste` (an image
-  alone, into a terminal on another machine: copied there, its path pasted; a
-  local program reads the clipboard itself), `terminal.paste_image` (Ctrl+V: the
-  same for an image; otherwise Ctrl+V goes to the program). TIFF and BMP clipboard
+  `terminal.show {terminal?, pane?}`, `terminal.copy`, `terminal.paste` (copied
+  files, such as Finder's or a clipboard manager's image, as if dropped; an image
+  alone as `terminal.paste_image` pastes it), `terminal.paste_image` (Ctrl+V: an
+  image, into a terminal on another machine: copied there, its path pasted; on
+  Windows, clipboard text is pasted; otherwise Ctrl+V goes to the program, which
+  reads the clipboard itself). TIFF and BMP clipboard
   images are converted to PNG before sending,
   `terminal.right_click {to: "program" | "menu", terminal?}` (where right-clicks go
   when the program takes the mouse; kept as its label `herdr.right-click=program`;
   Shift+right-click is always Herdr's menu). Copy, paste, paste-image and implicit
   right-click targeting follow keyboard focus, including peek and floating terminals;
   with no terminal holding keyboard focus, they use the focused pane or block.
+  Dragging a text selection past the terminal's top or bottom scrolls while held;
+  releasing stops it. Programs that track the mouse still get their mouse events
+  (hold Shift to select text instead). A drag stays with the terminal where it
+  started, including its release outside the pane; other panes don't receive it.
+  Terminals display Kitty graphics, including Unicode placeholder images used by
+  programs such as yazi; partial images and scrolling follow the placeholder cells.
 - Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`.
 - Layout: `layout.switch {name?}`, `layout.toggle {id}`, `layout.show {id}`, `layout.hide {id}`,
   `layout.resize {id, px | weight}`, `layout.select {stack, child}`, `layout.set {layout}`
   (personal tree edits; on shipped layouts only click/look fields change),
   `layout.reset {name?}` (reset a shipped layout and its clicks),
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
-- App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}`, `overlay.close {id?}`, `app.help`, `app.palette`, `app.settings {section?}`
-  (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do),
-  `app.check_updates`, `app.backend {backend}` (`"herdr-core"` or `"rex"`), `app.update_core` (a newer herdr-core of this generation, terminals kept;
+- App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `overlay.close {id?}`, `app.help`, `app.palette` (again: closes it), `app.settings {section?}`
+  (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do).
+  `app.check_updates` (only a successful check reports Up to date; a failed check clears the checked time and can be retried), `app.backend {backend}` (`"herdr-core"` or `"rex"`), `app.update_core` (a newer herdr-core of this generation, terminals kept;
   never one a package manager owns), `app.welcome`, `app.whats_new`, `app.feedback {message?, from?}` (from `"person"` or `"agent"`; opens a review window, where the person can paste up to 3 screenshots; never sends until the person clicks Send), `app.reset`,
   `app.theme {name}`, `app.zoom_in`, `app.zoom_out`, `app.zoom_reset`,
   `app.update` (restart into a downloaded update).
+  Add machine lists all named ssh-config hosts in a scrollable list. Setup
+  prompts open above the picker; close the setup terminal to return to the
+  updated list and any machine-specific guidance.
 - Window: `window.minimize`, `window.maximize` (or back), `window.close`.
 - macOS: `app.quit`, `app.hide`, `app.hide_others`, `app.show_all`.
 
@@ -573,7 +602,8 @@ What's about the user, never a look:
   When an agent needs the person, or finishes while they aren't looking at
   it, Herdr plays a sound and (unless they're looking) posts a toast that
   goes there when clicked. `done` / `blocked` replace the bundled MP3s
-  (path absolute or relative to `~/.config/herdr-app`).
+  (path absolute or relative to `~/.config/herdr-app`). Changes apply live,
+  including the Play buttons in Settings > Alerts.
 - `core`: the herdr-core binary to use, when it isn't where Herdr looks
   (PATH, the login shell's PATH, `~/.local/bin`, Homebrew, mise, Nix,
   cargo). Read at start.
@@ -633,7 +663,7 @@ What's about the user, never a look:
   Finder launches load the login shell's PATH, with the usual install
   folders as a fallback.
 - `option_as_alt`: macOS only, `"auto"` (default), `"on"`, or `"off"`.
-  `"auto"` sends Option as Alt on US, US International, ABC and ABC variants;
+  `"auto"` sends Option as Alt on US, US International, ABC and ABC-India;
   other layouts keep native Option text and dead keys. `"on"` enables terminal
   Alt shortcuts (including Option+E without composition); `"off"` keeps native
   Option input on every layout. Changes apply immediately, including layout
@@ -687,7 +717,9 @@ has 120 programs (agents, editors, runtimes, tools, databases, infra);
   `"claude": { "run": ["my-claude"] }` or add
   `"claude-alt": { "name": "Claude (alt)", "icon": "icons/claude.svg", "run": ["my-claude-alt"] }`
   inside `programs`. Use programs or shell functions, not aliases (the launcher
-  does not expand them). Local checks include functions in shells such as bash
+  does not expand them). On macOS the menu launcher loads login profiles before
+  running the agent and leaves an interactive login shell when it ends.
+  Linux keeps interactive non-login shells. Local checks include functions in shells such as bash
   and zsh; fish and remote checks find executables only. Installation
   checks are cached for up to a minute; changing the commands checks again.
   Invalid JSON is reported in `programs.error` (a valid file has no error).

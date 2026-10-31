@@ -92,7 +92,7 @@ pub struct CoreInfo {
 }
 
 static CORE: Mutex<CoreInfo> = Mutex::new(CoreInfo { version: None, managed: None, ready: None, updating: false, error: None });
-/// When the last check finished (unix seconds), for "checked at".
+/// When the last check succeeded (unix seconds); a failed check clears it.
 static CHECKED: Mutex<Option<u64>> = Mutex::new(None);
 /// "Check now" wakes the checker early.
 static WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
@@ -160,11 +160,13 @@ pub fn start() {
         return;
     }
     RUNNING.store(true, Ordering::Relaxed);
+    CHECKING.store(true, Ordering::Relaxed);
     std::thread::spawn(move || {
         sleep(Duration::from_secs(10));
         loop {
             CHECKING.store(true, Ordering::Relaxed);
             let mut wait = EVERY;
+            let mut succeeded = true;
             if let Some(root) = &app {
                 match check(root) {
                     Ok(found) => {
@@ -176,19 +178,25 @@ pub fn start() {
                         tracing::warn!("update check: {e}");
                         crate::telemetry::count("app_update_failed");
                         wait = RETRY;
+                        succeeded = false;
                     }
                 }
             }
             if core && let Err(e) = check_core() {
                 tracing::warn!("core update check: {e}");
                 wait = RETRY;
+                succeeded = false;
             }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            *CHECKED.lock().unwrap() = Some(now);
+            *CHECKED.lock().unwrap() = checked_at(succeeded, now);
             CHECKING.store(false, Ordering::Relaxed);
             sleep(wait);
         }
     });
+}
+
+fn checked_at(succeeded: bool, now: u64) -> Option<u64> {
+    succeeded.then_some(now)
 }
 
 /// Looks for a newer core of this app's generation.
@@ -258,8 +266,12 @@ pub fn update_core() {
 
 /// Downloads the latest release if it's newer. Ok(Some): a version is ready.
 fn check(root: &Path) -> Result<Option<String>, String> {
+    check_from(root, &releases())
+}
+
+fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
     let path = "app/latest.json";
-    let text = curl_text(&format!("{}/{path}", releases()))?;
+    let text = curl_text(&format!("{releases}/{path}"))?;
     let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
     let version = manifest["version"].as_str().ok_or(format!("{path}: no version"))?;
     if !newer(version, env!("CARGO_PKG_VERSION")) {
@@ -267,7 +279,7 @@ fn check(root: &Path) -> Result<Option<String>, String> {
     }
     // Notes are optional: a missing feed must never hold up the update.
     if !crate::update_notes::has(version)
-        && let Ok(text) = curl_text(&format!("{}/app/{version}/changelog.md", releases()))
+        && let Ok(text) = curl_text(&format!("{releases}/app/{version}/changelog.md"))
     {
         crate::update_notes::cache(&text);
     }
@@ -308,23 +320,37 @@ fn unpack(url: &str, sha: &str, work: &Path) -> Result<PathBuf, String> {
     run(crate::spawn::command(system("tar")).arg("-xzf").arg(&tarball).arg("-C").arg(work))?;
     let app = work.join(PACKED);
     if cfg!(target_os = "macos") {
-        let signature = Command::new("codesign").arg("-dv").arg(&app).output().map_err(|e| format!("codesign: {e}"))?;
-        if certificate_signed(&String::from_utf8_lossy(&signature.stderr)) {
-            run(Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(&app))?;
-        } else {
-            // Only dev builds may change the plist and lose their signature.
-            let home = std::env::var("HOME").unwrap_or_default();
-            let path = format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
-            let plist = app.join("Contents/Info.plist");
-            run(Command::new("/usr/libexec/PlistBuddy").arg("-c").arg(format!("Add :LSEnvironment:PATH string {path}")).arg(&plist))?;
-            run(Command::new("codesign").args(["--force", "--sign", "-"]).arg(&app))?;
-        }
+        // Authority is absent at -dv, even for a Developer ID release.
+        let signature = Command::new("/usr/bin/codesign").arg("-dvv").arg(&app).output().map_err(|e| format!("codesign: {e}"))?;
+        prepare_macos_bundle(&app, &signature)?;
     }
     Ok(app)
 }
 
-fn certificate_signed(signature: &str) -> bool {
-    signature.lines().any(|line| line.starts_with("Authority="))
+fn prepare_macos_bundle(app: &Path, signature: &std::process::Output) -> Result<(), String> {
+    if release_signature(signature.status.success(), &String::from_utf8_lossy(&signature.stderr))? {
+        run(Command::new("/usr/bin/codesign").args(["--verify", "--deep", "--strict"]).arg(app))?;
+    } else {
+        // Only known dev builds may change the plist and lose their signature.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+        let plist = app.join("Contents/Info.plist");
+        run(Command::new("/usr/libexec/PlistBuddy").arg("-c").arg(format!("Add :LSEnvironment:PATH string {path}")).arg(&plist))?;
+        run(Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(app))?;
+    }
+    Ok(())
+}
+
+fn release_signature(success: bool, signature: &str) -> Result<bool, String> {
+    if success && signature.lines().any(|line| line.starts_with("Authority=Developer ID Application:")) {
+        Ok(true)
+    } else if (success && signature.lines().any(|line| line == "Signature=adhoc"))
+        || (!success && signature.lines().any(|line| line.ends_with(": code object is not signed at all")))
+    {
+        Ok(false)
+    } else {
+        Err(format!("cannot determine app signature: {}", signature.trim()))
+    }
 }
 
 /// curl and tar: on Windows its own (System32), since Git's tar, often first
@@ -583,6 +609,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_check_clears_success_and_recovery_records_a_new_time() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // An isolated release server drops the first connection, then recovers.
+        // No environment changes, app window, core, or installed files are involved.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for recover in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(request.starts_with(b"GET /app/latest.json HTTP/1.1\r\n"));
+                if recover {
+                    let body = format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION"));
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+        });
+        let home = std::env::temp_dir().join(format!("herdr-offline-check-{}", std::process::id()));
+        let mut checked = checked_at(true, 100);
+        assert_eq!(checked, Some(100));
+        let failed = check_from(&home, &url);
+        assert!(failed.is_err(), "a dropped connection must fail: {failed:?}");
+        checked = checked_at(failed.is_ok(), 200);
+        assert_eq!(checked, None);
+        let recovered = check_from(&home, &url);
+        assert_eq!(recovered, Ok(None));
+        checked = checked_at(recovered.is_ok(), 300);
+        assert_eq!(checked, Some(300));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn startup_applies_only_a_newer_version_and_never_relaunches_twice() {
         assert_eq!(startup_target("0.1.7", Some("0.1.8"), None), Some("0.1.8"));
         for staged in [None, Some("0.1.6"), Some("0.1.7")] {
@@ -622,10 +688,83 @@ mod tests {
     }
 
     #[test]
-    fn certificate_signatures_are_preserved() {
-        assert!(certificate_signed("Executable=/Herdr.app/Contents/MacOS/Herdr\nAuthority=Developer ID Application: Herdr (TEAM)\nAuthority=Developer ID Certification Authority\n"));
-        assert!(!certificate_signed("Executable=/Herdr.app/Contents/MacOS/Herdr\nSignature=adhoc\nTeamIdentifier=not set\n"));
-        assert!(!certificate_signed("/Herdr.app: code object is not signed at all\n"));
+    fn signature_inspection_fails_closed() {
+        let release = include_str!("../scripts/fixtures/codesign/developer-id.txt");
+        let adhoc = include_str!("../scripts/fixtures/codesign/adhoc.txt");
+        let unsigned = include_str!("../scripts/fixtures/codesign/unsigned.txt");
+        assert_eq!(release_signature(true, release), Ok(true));
+        assert_eq!(release_signature(true, adhoc), Ok(false));
+        assert_eq!(release_signature(false, unsigned), Ok(false));
+        for (success, output) in [(false, release), (false, adhoc), (true, unsigned), (true, ""), (false, "codesign: internal error"), (true, "Authority=Apple Development: Someone")] {
+            assert!(release_signature(success, output).unwrap_err().starts_with("cannot determine app signature:"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_signature_does_not_modify_the_bundle() {
+        use std::os::unix::process::ExitStatusExt;
+        let work = std::env::temp_dir().join(format!("herdr-unknown-signature-{}", std::process::id()));
+        let plist = work.join("Contents/Info.plist");
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "unchanged plist").unwrap();
+        let signature = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"codesign: internal error".to_vec(),
+        };
+        assert_eq!(prepare_macos_bundle(&work, &signature), Err("cannot determine app signature: codesign: internal error".into()));
+        assert_eq!(std::fs::read_to_string(plist).unwrap(), "unchanged plist");
+        assert_eq!(std::fs::read_dir(work.join("Contents")).unwrap().count(), 1);
+        std::fs::remove_dir_all(work).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "downloads the current release; runs real codesign on isolated bundles"]
+    fn macos_unpack_preserves_release_signature_and_prepares_dev_builds() {
+        let version = env!("CARGO_PKG_VERSION");
+        let manifest: serde_json::Value = serde_json::from_str(&curl_text(&format!("{}/app/{version}/manifest.json", releases())).unwrap()).unwrap();
+        let work = std::env::temp_dir().join(format!("herdr-signature-test-{}", std::process::id()));
+        let signed = work.join("signed");
+        let reference = work.join("reference");
+        std::fs::create_dir_all(&signed).unwrap();
+        std::fs::create_dir_all(&reference).unwrap();
+        let entry = &manifest["targets"][target()];
+        let app = unpack(entry["url"].as_str().unwrap(), entry["sha256"].as_str().unwrap(), &signed).unwrap();
+        let signature = Command::new("/usr/bin/codesign").arg("-dvv").arg(&app).output().unwrap();
+        assert_eq!(release_signature(signature.status.success(), &String::from_utf8_lossy(&signature.stderr)), Ok(true));
+        run(Command::new("/usr/bin/codesign").args(["--verify", "--deep", "--strict"]).arg(&app)).unwrap();
+        run(Command::new("tar").arg("-xzf").arg(signed.join("app.tar.gz")).arg("-C").arg(&reference)).unwrap();
+        for file in ["Contents/Info.plist", "Contents/MacOS/Herdr", "Contents/_CodeSignature/CodeResources"] {
+            assert_eq!(std::fs::read(app.join(file)).unwrap(), std::fs::read(reference.join(PACKED).join(file)).unwrap(), "{file} was modified");
+        }
+        for kind in ["adhoc", "unsigned"] {
+            let source = reference.join(PACKED);
+            let mut codesign = Command::new("/usr/bin/codesign");
+            if kind == "adhoc" {
+                codesign.args(["--force", "--sign", "-"]);
+            } else {
+                codesign.arg("--remove-signature");
+            }
+            run(codesign.arg(&source)).unwrap();
+            let archive = work.join(format!("{kind}.tar.gz"));
+            run(Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(&reference).arg(PACKED)).unwrap();
+            let dev = work.join(kind);
+            std::fs::create_dir_all(&dev).unwrap();
+            let sha = sha256(&std::fs::read(&archive).unwrap());
+            let app = unpack(&format!("file://{}", archive.display()), &sha, &dev).unwrap();
+            let signature = Command::new("/usr/bin/codesign").arg("-dvv").arg(&app).output().unwrap();
+            assert!(signature.status.success());
+            let signature = String::from_utf8_lossy(&signature.stderr);
+            assert_eq!(release_signature(true, &signature), Ok(false));
+            assert!(signature.lines().any(|line| line == "Signature=adhoc"));
+            run(Command::new("/usr/bin/codesign").args(["--verify", "--deep", "--strict"]).arg(&app)).unwrap();
+            let path = Command::new("/usr/libexec/PlistBuddy").args(["-c", "Print :LSEnvironment:PATH"]).arg(app.join("Contents/Info.plist")).output().unwrap();
+            assert!(path.status.success());
+            assert!(String::from_utf8_lossy(&path.stdout).contains("/opt/homebrew/bin"));
+        }
+        std::fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

@@ -1404,6 +1404,9 @@ impl Link for RexLink {
         }
     }
 
+    /// Rex owns its terminal's device-query answers and has no display-facts message.
+    fn facts(&self, _channel: u32, _display: &Value) {}
+
     fn focus(&self, channel: u32, focused: bool) {
         if focused
             && let Some(server) = self.channel(channel)
